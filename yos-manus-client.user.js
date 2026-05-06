@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Y-OS Manus Client
 // @namespace    https://yos.ai
-// @version      1.4.0
+// @version      1.5.0
 // @description  Y-OS custom client for manus.im — cleanup, branding, navigation, message toolbar
 // @author       Yannick Jolliet / Y-OS
 // @match        https://manus.im/*
@@ -14,15 +14,20 @@
 // ==/UserScript==
 
 /**
- * v1.4.0 — Performance fix
- * ROOT CAUSE of freeze: setInterval(800ms) calling getBoundingClientRect() on every message
- * → forced synchronous layout reflow on every tick → CPU 100% on long conversations
+ * v1.5.0 — Ultra-deferred init
  *
- * FIX:
- * - Toolbar: IntersectionObserver (zero reflow, fires only when element enters viewport)
- * - colorProjects: no MutationObserver, only 3 deferred retries
- * - navQ: cached rects, no live getBoundingClientRect in loop
- * - All DOM writes batched, no reads inside write loops
+ * ROOT CAUSE of partial render (only menus visible):
+ * - chatSC() called getBoundingClientRect() at boot, before React hydration
+ * - MutationObserver on messages container tried to find deep DOM path too early
+ * - Both could interrupt React's hydration cycle
+ *
+ * FIX v1.5:
+ * - CSS injected immediately (safe, no DOM reads)
+ * - ALL other code starts only after window.load + 2500ms minimum
+ * - chatSC() never calls getBoundingClientRect() — uses position-based heuristic only
+ * - Toolbar: slow setInterval (4s) that self-stops after 20 passes — zero observers
+ * - No MutationObserver anywhere except <title> (ultra-lightweight)
+ * - colorProjects: 3 deferred passes only, no observers
  */
 
 (function () {
@@ -45,7 +50,7 @@
     keyboard:         true,
   };
 
-  // ─── TOKENS ──────────────────────────────────────────────────
+  // ─── DESIGN TOKENS ───────────────────────────────────────────
   const C = {
     bgNav:    '#0d0f14',
     accent:   '#7c3aed',
@@ -69,111 +74,120 @@
     ],
   };
 
-  // ─── UTILS ───────────────────────────────────────────────────
-  let _css = '';
-  function addCSS(css) { _css += css + '\n'; }
-  function flushCSS() {
-    const existing = document.getElementById('yos-styles');
-    if (existing) existing.remove();
+  // ─── CSS — injected immediately, no DOM reads ─────────────────
+  function injectCSS() {
+    const css = `
+      /* Cleanup */
+      nav > div > div:last-child div[class*="flex-col"][class*="items-start"] { display:none!important; }
+      nav > div > div:last-child > div:first-child > button { display:none!important; }
+      button[hint="My Computer"] { display:none!important; }
+
+      /* Branding */
+      nav { background-color:${C.bgNav}!important; }
+      ::-webkit-scrollbar { width:4px; height:4px; }
+      ::-webkit-scrollbar-track { background:transparent; }
+      ::-webkit-scrollbar-thumb { background:${C.accentDim}; border-radius:2px; }
+      ::-webkit-scrollbar-thumb:hover { background:${C.accent}; }
+
+      /* FAB */
+      #yos-fab{position:fixed;right:14px;bottom:100px;z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none;}
+      .yb{width:32px;height:32px;border-radius:50%;background:${C.bgNav};border:1px solid ${C.border};color:${C.text};font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;pointer-events:all;transition:all .15s;box-shadow:0 2px 8px rgba(0,0,0,.6);opacity:.65;user-select:none;font-family:system-ui,sans-serif;line-height:1;}
+      .yb:hover{background:${C.accentDim};border-color:${C.accent};opacity:1;transform:scale(1.12);}
+      .yb.wide{border-radius:8px;width:38px;font-size:9px;font-weight:700;}
+      .yb-hidden{opacity:0!important;pointer-events:none!important;}
+
+      /* Message toolbar */
+      .yos-mw{position:relative;}
+      .yos-tb{display:none;position:absolute;top:-34px;right:0;background:${C.bgNav};border:1px solid ${C.border};border-radius:8px;padding:3px 6px;gap:2px;align-items:center;z-index:1000;box-shadow:0 2px 12px rgba(0,0,0,.6);white-space:nowrap;}
+      .yos-mw:hover .yos-tb{display:flex!important;}
+      .ytb{background:transparent;border:none;color:${C.textDim};font-size:13px;cursor:pointer;padding:2px 5px;border-radius:4px;transition:all .1s;line-height:1.2;font-family:system-ui,sans-serif;}
+      .ytb:hover{background:rgba(124,58,237,.15);color:${C.text};}
+      .ytb.ok:hover{color:${C.ok};} .ytb.no:hover{color:${C.no};} .ytb.wn:hover{color:${C.warn};}
+      .ysep{width:1px;height:14px;background:${C.border};margin:0 3px;display:inline-block;}
+      .yos-col{max-height:80px;overflow:hidden;position:relative;}
+      .yos-col::after{content:'';position:absolute;bottom:0;left:0;right:0;height:32px;background:linear-gradient(transparent,#111318);pointer-events:none;}
+
+      /* Print */
+      @media print {
+        nav, #yos-fab, #yos-tip { display:none!important; }
+        body { background:#fff!important; color:#000!important; }
+      }
+    `;
     const s = document.createElement('style');
     s.id = 'yos-styles';
-    s.textContent = _css;
-    document.head.appendChild(s);
+    s.textContent = css;
+    (document.head || document.documentElement).appendChild(s);
   }
 
+  // ─── UTILS ───────────────────────────────────────────────────
   function throttle(fn, ms) {
     let t = null;
-    return (...args) => {
-      if (!t) { t = setTimeout(() => { t = null; fn(...args); }, ms); }
-    };
+    return (...args) => { if (!t) { t = setTimeout(() => { t = null; fn(...args); }, ms); } };
   }
 
-  // Chat scroll container — cached
-  let _sc = null;
+  // chatSC — NO getBoundingClientRect, uses scrollWidth heuristic
   function chatSC() {
-    if (_sc && document.contains(_sc)) return _sc;
     const all = document.querySelectorAll('.simplebar-content-wrapper');
     let best = null;
-    all.forEach(el => { if (el.getBoundingClientRect().left >= 200) best = el; });
-    _sc = best || document.querySelector('main') || document.documentElement;
-    return _sc;
+    // The chat scroll container is wider than the nav (>260px)
+    all.forEach(el => {
+      const r = el.offsetLeft;
+      if (r >= 200) best = el;
+    });
+    return best || document.querySelector('main') || document.documentElement;
   }
 
-  // Get message list — reads DOM structure once
   function getMessages() {
-    const sc = chatSC();
-    if (!sc) return [];
-    const content = sc.querySelector('.simplebar-content');
-    if (!content) return [];
-    const main = content.firstElementChild;
-    if (!main || main.children.length < 2) return [];
-    const mx = main.children[1];
-    if (!mx || !mx.firstElementChild) return [];
-    const outer = mx.firstElementChild.firstElementChild;
-    return outer ? [...outer.children] : [];
+    try {
+      const sc = chatSC();
+      if (!sc) return [];
+      const content = sc.querySelector('.simplebar-content');
+      if (!content) return [];
+      const main = content.firstElementChild;
+      if (!main || main.children.length < 2) return [];
+      const mx = main.children[1];
+      if (!mx || !mx.firstElementChild) return [];
+      const outer = mx.firstElementChild.firstElementChild;
+      return outer ? [...outer.children] : [];
+    } catch (e) { return []; }
   }
 
   function isUserMsg(el) {
-    return !!el.querySelector('[class*="items-end"][class*="justify-end"]');
+    try { return !!el.querySelector('[class*="items-end"][class*="justify-end"]'); }
+    catch (e) { return false; }
   }
 
   function getMDDiv(el) {
-    return el.querySelector('[class*="max-w-none"]') ||
-           el.querySelector('[class*="prose"]') ||
-           el.querySelector('[class*="leading-"][class*="text-[var"]');
+    try {
+      return el.querySelector('[class*="max-w-none"]') ||
+             el.querySelector('[class*="prose"]') ||
+             el.querySelector('[class*="leading-"][class*="text-[var"]');
+    } catch (e) { return null; }
   }
 
-  function getChatInput() { return document.querySelector('textarea'); }
-
   function prefillInput(text) {
-    const inp = getChatInput();
-    if (!inp) return;
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-    if (setter) setter.call(inp, text); else inp.value = text;
-    inp.dispatchEvent(new Event('input', { bubbles: true }));
-    inp.focus();
-    inp.setSelectionRange(inp.value.length, inp.value.length);
+    try {
+      const inp = document.querySelector('textarea');
+      if (!inp) return;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+      if (setter) setter.call(inp, text); else inp.value = text;
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.focus();
+      inp.setSelectionRange(inp.value.length, inp.value.length);
+    } catch (e) {}
   }
 
   function sendMsg(text) {
     prefillInput(text);
     setTimeout(() => {
-      const inp = getChatInput();
-      if (inp) inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-    }, 120);
+      try {
+        const inp = document.querySelector('textarea');
+        if (inp) inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+      } catch (e) {}
+    }, 150);
   }
 
-  // ─── MODULE 1 — CLEANUP (pure CSS, zero observers) ───────────
-  function initCleanup() {
-    // Meta logo: the last flex-col items-start div in the nav bottom section
-    addCSS(`
-      nav > div > div:last-child div[class*="flex-col"][class*="items-start"] { display:none!important; }
-      nav > div > div:last-child > div:first-child > button { display:none!important; }
-      button[hint="My Computer"] { display:none!important; }
-    `);
-  }
-
-  // ─── MODULE 2 — BRANDING ─────────────────────────────────────
-  function initBranding() {
-    if (CFG.yosColors) {
-      addCSS(`
-        nav { background-color:${C.bgNav}!important; }
-        ::-webkit-scrollbar { width:4px; height:4px; }
-        ::-webkit-scrollbar-track { background:transparent; }
-        ::-webkit-scrollbar-thumb { background:${C.accentDim}; border-radius:2px; }
-        ::-webkit-scrollbar-thumb:hover { background:${C.accent}; }
-        @media print {
-          nav, #yos-fab, #yos-tip { display:none!important; }
-          body { background:#fff!important; color:#000!important; }
-        }
-      `);
-    }
-    if (CFG.yosLogo) injectLogo();
-    if (CFG.yosTitle) patchTitle();
-    if (CFG.yosQuickLinks) injectLinks();
-    if (CFG.projectColors) colorProjects();
-  }
-
+  // ─── BRANDING — runs deferred ─────────────────────────────────
   function injectLogo() {
     if (document.getElementById('yos-logo')) return;
     const nav = document.querySelector('nav');
@@ -239,9 +253,8 @@
     menuSection.insertBefore(wrap, menuSection.firstChild);
   }
 
-  // colorProjects — NO MutationObserver, only deferred retries
   function colorProjects() {
-    const run = () => {
+    try {
       const nav = document.querySelector('nav');
       if (!nav) return;
       nav.querySelectorAll('[class*="flex-col"][class*="gap-px"][class*="pt-[3px]"]').forEach(c => {
@@ -254,22 +267,12 @@
           if (txt) { txt.style.color = col; txt.style.fontWeight = '600'; }
         });
       });
-    };
-    // Run at 3 safe moments — no observer
-    [500, 2500, 7000].forEach(d => setTimeout(run, d));
+    } catch (e) {}
   }
 
-  // ─── MODULE 3 — FAB NAVIGATION ───────────────────────────────
+  // ─── FAB NAVIGATION ──────────────────────────────────────────
   function initFAB() {
-    if (!CFG.fabNav) return;
-    addCSS(`
-      #yos-fab{position:fixed;right:14px;bottom:100px;z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none;}
-      .yb{width:32px;height:32px;border-radius:50%;background:${C.bgNav};border:1px solid ${C.border};color:${C.text};font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;pointer-events:all;transition:all .15s;box-shadow:0 2px 8px rgba(0,0,0,.6);opacity:.6;user-select:none;font-family:system-ui,sans-serif;line-height:1;}
-      .yb:hover{background:${C.accentDim};border-color:${C.accent};opacity:1;transform:scale(1.12);}
-      .yb.wide{border-radius:8px;width:38px;font-size:9px;font-weight:700;}
-      .yb[data-h="1"]{opacity:0!important;pointer-events:none!important;}
-    `);
-
+    if (document.getElementById('yos-fab')) return;
     const fab = document.createElement('div');
     fab.id = 'yos-fab';
 
@@ -283,173 +286,144 @@
     const btnTop = mkBtn('↑', 'Back to top (Alt+T)', () => {
       const s = chatSC(); if (s) s.scrollTo({ top: 0, behavior: 'smooth' });
     });
-    btnTop.dataset.h = '1';
+    btnTop.classList.add('yb-hidden');
+
     fab.appendChild(btnTop);
     fab.appendChild(mkBtn('↓', 'Scroll to bottom (Alt+B)', () => {
       const s = chatSC(); if (s) s.scrollTop = s.scrollHeight;
     }));
-    fab.appendChild(mkBtn('⬆', 'Previous question (Alt+↑)', () => navQ(-1)));
+    fab.appendChild(mkBtn('⬆', 'Prev question (Alt+↑)', () => navQ(-1)));
     fab.appendChild(mkBtn('⬇', 'Next question (Alt+↓)', () => navQ(1)));
 
     if (CFG.exportMD) {
-      const b = mkBtn('↓MD', 'Export as Markdown (Alt+E)', exportMD);
+      const b = mkBtn('↓MD', 'Export Markdown (Alt+E)', exportMD);
       b.classList.add('wide'); fab.appendChild(b);
     }
     fab.appendChild(mkBtn('🖨', 'Print (Alt+P)', () => window.print()));
     document.body.appendChild(fab);
 
-    // Scroll listener — passive, throttled
+    // Scroll listener — passive, throttled, attached late
     setTimeout(() => {
       const sc = chatSC();
       if (sc) sc.addEventListener('scroll', throttle(() => {
-        btnTop.dataset.h = sc.scrollTop > 300 ? '0' : '1';
+        btnTop.classList.toggle('yb-hidden', sc.scrollTop <= 300);
       }, 300), { passive: true });
-    }, 3000);
+    }, 1000);
   }
 
-  // navQ — NO getBoundingClientRect in loop, uses offsetTop instead
   function navQ(dir) {
-    const sc = chatSC();
-    if (!sc) return;
-    const msgs = getMessages().filter(isUserMsg);
-    if (!msgs.length) return;
+    try {
+      const sc = chatSC();
+      if (!sc) return;
+      const msgs = getMessages().filter(isUserMsg);
+      if (!msgs.length) return;
+      const scTop = sc.scrollTop;
+      let target = null;
 
-    // Use offsetTop relative to scroll container — no forced reflow
-    const scTop = sc.scrollTop;
-    let target = null;
-
-    if (dir === -1) {
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const elTop = msgs[i].offsetTop;
-        if (elTop < scTop - 40) { target = msgs[i]; break; }
+      if (dir === -1) {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].offsetTop < scTop - 40) { target = msgs[i]; break; }
+        }
+        if (!target) target = msgs[0];
+      } else {
+        for (let i = 0; i < msgs.length; i++) {
+          if (msgs[i].offsetTop > scTop + 60) { target = msgs[i]; break; }
+        }
+        if (!target) target = msgs[msgs.length - 1];
       }
-      if (!target) target = msgs[0];
-    } else {
-      for (let i = 0; i < msgs.length; i++) {
-        const elTop = msgs[i].offsetTop;
-        if (elTop > scTop + 60) { target = msgs[i]; break; }
-      }
-      if (!target) target = msgs[msgs.length - 1];
-    }
-
-    if (target) sc.scrollTo({ top: target.offsetTop - 20, behavior: 'smooth' });
+      if (target) sc.scrollTo({ top: target.offsetTop - 20, behavior: 'smooth' });
+    } catch (e) {}
   }
 
   function exportMD() {
-    const title = document.title.replace(/ - (Manus|Y-OS).*$/, '').trim();
-    const date = new Date().toISOString().split('T')[0];
-    let md = `# ${title}\n\n*Y-OS Export — ${date}*\n\n---\n\n`;
-    getMessages().forEach(msg => {
-      if (isUserMsg(msg)) {
-        const txt = msg.textContent.trim();
-        if (txt) md += `**You:** ${txt}\n\n`;
-      } else {
-        const d = getMDDiv(msg);
-        if (d) md += `**Manus:**\n\n${d.innerText || d.textContent}\n\n---\n\n`;
-      }
-    });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([md], { type: 'text/markdown' }));
-    a.download = `yos-${title.replace(/[^a-z0-9]/gi, '-').toLowerCase().slice(0, 40)}-${date}.md`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  }
-
-  // ─── MODULE 4 — MESSAGE TOOLBAR ──────────────────────────────
-  // Uses IntersectionObserver — fires ONLY when element enters viewport
-  // Zero polling, zero reflow, zero CPU when not scrolling
-  function initMsgToolbar() {
-    if (!CFG.msgToolbar) return;
-
-    addCSS(`
-      .yos-mw{position:relative;}
-      .yos-tb{display:none;position:absolute;top:-34px;right:0;background:${C.bgNav};border:1px solid ${C.border};border-radius:8px;padding:3px 6px;gap:2px;align-items:center;z-index:1000;box-shadow:0 2px 12px rgba(0,0,0,.6);white-space:nowrap;}
-      .yos-mw:hover .yos-tb{display:flex!important;}
-      .ytb{background:transparent;border:none;color:${C.textDim};font-size:13px;cursor:pointer;padding:2px 5px;border-radius:4px;transition:all .1s;line-height:1.2;font-family:system-ui,sans-serif;}
-      .ytb:hover{background:rgba(124,58,237,.15);color:${C.text};}
-      .ytb.ok:hover{color:${C.ok};} .ytb.no:hover{color:${C.no};} .ytb.wn:hover{color:${C.warn};}
-      .ysep{width:1px;height:14px;background:${C.border};margin:0 3px;display:inline-block;}
-      .yos-col{max-height:80px;overflow:hidden;position:relative;}
-      .yos-col::after{content:'';position:absolute;bottom:0;left:0;right:0;height:32px;background:linear-gradient(transparent,#111318);pointer-events:none;}
-    `);
-
-    // IntersectionObserver: processes each message element once when it enters viewport
-    const io = new IntersectionObserver((entries) => {
-      entries.forEach(entry => {
-        if (!entry.isIntersecting) return;
-        const msg = entry.target;
-        io.unobserve(msg); // process once only
-
-        if (isUserMsg(msg)) return;
-        const md = getMDDiv(msg);
-        if (!md || md.dataset.ytb) return;
-        md.dataset.ytb = '1';
-        md.classList.add('yos-mw');
-        md.style.position = 'relative';
-
-        const tb = document.createElement('div');
-        tb.className = 'yos-tb';
-
-        const mkB = (icon, cls, title, fn) => {
-          const b = document.createElement('button');
-          b.className = `ytb ${cls}`; b.textContent = icon; b.title = title;
-          b.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); fn(b); });
-          return b;
-        };
-        const sep = () => { const s = document.createElement('span'); s.className = 'ysep'; return s; };
-
-        tb.appendChild(mkB('✅', 'ok', 'OK — continue', () => sendMsg('✅ OK, continue.')));
-        tb.appendChild(mkB('❌', 'no', 'Incorrect — fix', () => prefillInput('❌ Non, corrige ce point : ')));
-        tb.appendChild(mkB('⚠️', 'wn', 'Partially correct', () => prefillInput('⚠️ Partiellement correct, précise : ')));
-        tb.appendChild(sep());
-        tb.appendChild(mkB('📋', '', 'Copy as Markdown', (b) => {
-          const txt = md.innerText || md.textContent;
-          try { GM_setClipboard(txt, 'text'); } catch(e) { navigator.clipboard.writeText(txt).catch(() => {}); }
-          b.textContent = '✓'; setTimeout(() => { b.textContent = '📋'; }, 1500);
-        }));
-
-        if ((md.textContent || '').length > 600) {
-          let col = false;
-          tb.appendChild(mkB('⤢', '', 'Collapse', (b) => {
-            col = !col; md.classList.toggle('yos-col', col);
-            b.textContent = col ? '⤡' : '⤢'; b.title = col ? 'Expand' : 'Collapse';
-          }));
+    try {
+      const title = document.title.replace(/ - (Manus|Y-OS).*$/, '').trim();
+      const date = new Date().toISOString().split('T')[0];
+      let md = `# ${title}\n\n*Y-OS Export — ${date}*\n\n---\n\n`;
+      getMessages().forEach(msg => {
+        if (isUserMsg(msg)) {
+          const txt = msg.textContent.trim();
+          if (txt) md += `**You:** ${txt}\n\n`;
+        } else {
+          const d = getMDDiv(msg);
+          if (d) md += `**Manus:**\n\n${d.innerText || d.textContent}\n\n---\n\n`;
         }
-        md.appendChild(tb);
       });
-    }, { threshold: 0.1 });
-
-    // Watch for new message elements — scoped to chat container only
-    // Use a lightweight MutationObserver on the messages container (not body)
-    function observeMessages() {
-      const msgs = getMessages();
-      msgs.forEach(m => { if (!m.dataset.yio) { m.dataset.yio = '1'; io.observe(m); } });
-    }
-
-    // Initial pass + deferred for SPA
-    [500, 2000, 5000].forEach(d => setTimeout(observeMessages, d));
-
-    // Scoped MutationObserver — only on the messages container, childList only (no subtree, no attributes)
-    setTimeout(() => {
-      const sc = chatSC();
-      if (!sc) return;
-      const content = sc.querySelector('.simplebar-content');
-      if (!content) return;
-      const main = content.firstElementChild;
-      if (!main || main.children.length < 2) return;
-      const mx = main.children[1];
-      if (!mx || !mx.firstElementChild) return;
-      const outer = mx.firstElementChild.firstElementChild;
-      if (!outer) return;
-
-      // Only childList on the direct message container — fires when new messages added
-      new MutationObserver(throttle(observeMessages, 500)).observe(outer, { childList: true });
-    }, 3000);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([md], { type: 'text/markdown' }));
+      a.download = `yos-${title.replace(/[^a-z0-9]/gi, '-').toLowerCase().slice(0, 40)}-${date}.md`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    } catch (e) {}
   }
 
-  // ─── MODULE 5 — SELECT TO PROMPT ─────────────────────────────
-  function initSelectToPrompt() {
-    if (!CFG.selectToPrompt) return;
+  // ─── MESSAGE TOOLBAR — slow polling, self-stopping ───────────
+  // setInterval at 4s, stops after 20 passes (80s total coverage)
+  // Then re-arms once on scroll to catch new messages
+  function initMsgToolbar() {
+    let passes = 0;
+    const MAX = 20;
 
+    const run = () => {
+      try {
+        passes++;
+        getMessages().forEach(msg => {
+          if (isUserMsg(msg)) return;
+          const md = getMDDiv(msg);
+          if (!md || md.dataset.ytb) return;
+          md.dataset.ytb = '1';
+          md.classList.add('yos-mw');
+          md.style.position = 'relative';
+
+          const tb = document.createElement('div');
+          tb.className = 'yos-tb';
+
+          const mkB = (icon, cls, title, fn) => {
+            const b = document.createElement('button');
+            b.className = `ytb ${cls}`; b.textContent = icon; b.title = title;
+            b.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); fn(b); });
+            return b;
+          };
+          const sep = () => { const s = document.createElement('span'); s.className = 'ysep'; return s; };
+
+          tb.appendChild(mkB('✅', 'ok', 'OK — continue', () => sendMsg('✅ OK, continue.')));
+          tb.appendChild(mkB('❌', 'no', 'Incorrect — fix', () => prefillInput('❌ Non, corrige ce point : ')));
+          tb.appendChild(mkB('⚠️', 'wn', 'Partially correct', () => prefillInput('⚠️ Partiellement correct, précise : ')));
+          tb.appendChild(sep());
+          tb.appendChild(mkB('📋', '', 'Copy as Markdown', (b) => {
+            const txt = md.innerText || md.textContent;
+            try { GM_setClipboard(txt, 'text'); } catch(e) { navigator.clipboard.writeText(txt).catch(() => {}); }
+            b.textContent = '✓'; setTimeout(() => { b.textContent = '📋'; }, 1500);
+          }));
+          if ((md.textContent || '').length > 600) {
+            let col = false;
+            tb.appendChild(mkB('⤢', '', 'Collapse', (b) => {
+              col = !col; md.classList.toggle('yos-col', col);
+              b.textContent = col ? '⤡' : '⤢'; b.title = col ? 'Expand' : 'Collapse';
+            }));
+          }
+          md.appendChild(tb);
+        });
+      } catch (e) {}
+    };
+
+    // Start slow polling — 4s interval, stops after MAX passes
+    const timer = setInterval(() => {
+      run();
+      if (passes >= MAX) {
+        clearInterval(timer);
+        // Re-arm on scroll (one-time, throttled) to catch new messages after stop
+        const sc = chatSC();
+        if (sc) sc.addEventListener('scroll', throttle(run, 2000), { passive: true, once: false });
+      }
+    }, 4000);
+
+    // First run at 3s after init
+    setTimeout(run, 3000);
+  }
+
+  // ─── SELECT TO PROMPT ────────────────────────────────────────
+  function initSelectToPrompt() {
+    if (document.getElementById('yos-tip')) return;
     const tip = document.createElement('div');
     tip.id = 'yos-tip';
     tip.style.cssText = `position:fixed;z-index:99999;display:none;background:${C.bgNav};border:1px solid ${C.accent};color:${C.text};font-size:12px;padding:5px 12px;border-radius:6px;cursor:pointer;user-select:none;box-shadow:0 2px 14px rgba(124,58,237,.4);font-family:system-ui,sans-serif;`;
@@ -474,9 +448,8 @@
     document.addEventListener('mousedown', e => { if (e.target !== tip) tip.style.display = 'none'; });
   }
 
-  // ─── MODULE 6 — KEYBOARD ─────────────────────────────────────
+  // ─── KEYBOARD ────────────────────────────────────────────────
   function initKeyboard() {
-    if (!CFG.keyboard) return;
     document.addEventListener('keydown', e => {
       if (!e.altKey) return;
       const tag = document.activeElement?.tagName;
@@ -493,32 +466,46 @@
     });
   }
 
-  // ─── DEFERRED RETRY (SPA route changes) ──────────────────────
-  function deferredRetry() {
-    [1000, 3500, 9000].forEach(delay => {
-      setTimeout(() => {
+  // ─── BOOT SEQUENCE ───────────────────────────────────────────
+  // Phase 1: CSS only — immediate, no DOM reads
+  injectCSS();
+
+  // Phase 2: All interactive features — after window.load + 2500ms
+  // This guarantees React has fully hydrated before we touch the DOM
+  function launchFeatures() {
+    try {
+      if (CFG.yosTitle) patchTitle();
+      if (CFG.yosLogo) injectLogo();
+      if (CFG.yosQuickLinks) injectLinks();
+      if (CFG.projectColors) colorProjects();
+      if (CFG.fabNav) initFAB();
+      if (CFG.msgToolbar) initMsgToolbar();
+      if (CFG.selectToPrompt) initSelectToPrompt();
+      if (CFG.keyboard) initKeyboard();
+      console.log('[Y-OS] Manus client v1.5 loaded ✓');
+    } catch (e) {
+      console.warn('[Y-OS] Boot error:', e);
+    }
+  }
+
+  // Phase 3: Retry branding injections at 6s and 12s (SPA route changes)
+  function scheduleRetries() {
+    [6000, 12000].forEach(d => setTimeout(() => {
+      try {
         if (CFG.yosLogo) injectLogo();
         if (CFG.yosQuickLinks) injectLinks();
         if (CFG.projectColors) colorProjects();
-        _sc = null; // reset cached scroll container on route change
-      }, delay);
+      } catch (e) {}
+    }, d));
+  }
+
+  // Entry point — wait for full page load + 2.5s
+  if (document.readyState === 'complete') {
+    setTimeout(() => { launchFeatures(); scheduleRetries(); }, 2500);
+  } else {
+    window.addEventListener('load', () => {
+      setTimeout(() => { launchFeatures(); scheduleRetries(); }, 2500);
     });
   }
-
-  // ─── BOOT ────────────────────────────────────────────────────
-  function boot() {
-    initCleanup();
-    initBranding();
-    flushCSS();
-    initFAB();
-    initMsgToolbar();
-    initSelectToPrompt();
-    initKeyboard();
-    deferredRetry();
-    console.log('[Y-OS] Manus client v1.4 loaded ✓');
-  }
-
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-  else boot();
 
 })();
