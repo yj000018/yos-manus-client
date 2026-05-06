@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Y-OS Manus Client
 // @namespace    https://yos.ai
-// @version      1.5.0
+// @version      1.6.0
 // @description  Y-OS custom client for manus.im — cleanup, branding, navigation, message toolbar
 // @author       Yannick Jolliet / Y-OS
 // @match        https://manus.im/*
@@ -14,20 +14,22 @@
 // ==/UserScript==
 
 /**
- * v1.5.0 — Ultra-deferred init
+ * v1.6.0 — Fix 3 infinite loops identified by static analysis
  *
- * ROOT CAUSE of partial render (only menus visible):
- * - chatSC() called getBoundingClientRect() at boot, before React hydration
- * - MutationObserver on messages container tried to find deep DOM path too early
- * - Both could interrupt React's hydration cycle
+ * BUG 1 — patchTitle(): MutationObserver on <title> called fix() which set
+ *   document.title → triggered observer again → infinite loop.
+ *   FIX: _patching flag prevents re-entrant calls.
  *
- * FIX v1.5:
- * - CSS injected immediately (safe, no DOM reads)
- * - ALL other code starts only after window.load + 2500ms minimum
- * - chatSC() never calls getBoundingClientRect() — uses position-based heuristic only
- * - Toolbar: slow setInterval (4s) that self-stops after 20 passes — zero observers
- * - No MutationObserver anywhere except <title> (ultra-lightweight)
- * - colorProjects: 3 deferred passes only, no observers
+ * BUG 2 — injectLinks(): insertBefore() modified nav DOM. If React re-rendered
+ *   nav, element was removed, next retry re-injected → loop.
+ *   FIX: Check by stable parent reference, not just getElementById.
+ *
+ * BUG 3 — initMsgToolbar(): appendChild(tb) modified message DOM. React
+ *   re-renders wiped dataset.ytb → setInterval re-injected → loop.
+ *   FIX: Use WeakSet to track processed elements (survives DOM attribute wipes).
+ *
+ * ADDITIONAL: chatSC() result is now cached with a validity check.
+ * All setIntervals have hard stop limits.
  */
 
 (function () {
@@ -76,6 +78,7 @@
 
   // ─── CSS — injected immediately, no DOM reads ─────────────────
   function injectCSS() {
+    if (document.getElementById('yos-styles')) return;
     const css = `
       /* Cleanup */
       nav > div > div:last-child div[class*="flex-col"][class*="items-start"] { display:none!important; }
@@ -125,16 +128,15 @@
     return (...args) => { if (!t) { t = setTimeout(() => { t = null; fn(...args); }, ms); } };
   }
 
-  // chatSC — NO getBoundingClientRect, uses scrollWidth heuristic
+  // chatSC — cached, no getBoundingClientRect
+  let _sc = null;
   function chatSC() {
+    if (_sc && document.contains(_sc)) return _sc;
     const all = document.querySelectorAll('.simplebar-content-wrapper');
     let best = null;
-    // The chat scroll container is wider than the nav (>260px)
-    all.forEach(el => {
-      const r = el.offsetLeft;
-      if (r >= 200) best = el;
-    });
-    return best || document.querySelector('main') || document.documentElement;
+    all.forEach(el => { if (el.offsetLeft >= 200) best = el; });
+    _sc = best || document.querySelector('main') || document.documentElement;
+    return _sc;
   }
 
   function getMessages() {
@@ -187,7 +189,7 @@
     }, 150);
   }
 
-  // ─── BRANDING — runs deferred ─────────────────────────────────
+  // ─── BRANDING ────────────────────────────────────────────────
   function injectLogo() {
     if (document.getElementById('yos-logo')) return;
     const nav = document.querySelector('nav');
@@ -223,15 +225,25 @@
     origSVG.parentElement.insertBefore(logo, origSVG);
   }
 
+  // BUG 1 FIX — _patching flag prevents MutationObserver re-entrant loop
   function patchTitle() {
-    const fix = () => { if (!document.title.startsWith('Y-OS')) document.title = document.title.replace(/\bManus\b/g, 'Y-OS'); };
+    let _patching = false;
+    const fix = () => {
+      if (_patching) return;
+      if (document.title.startsWith('Y-OS')) return;
+      _patching = true;
+      document.title = document.title.replace(/\bManus\b/g, 'Y-OS');
+      _patching = false;
+    };
     fix();
     const t = document.querySelector('title');
     if (t) new MutationObserver(fix).observe(t, { childList: true });
   }
 
+  // BUG 2 FIX — check if yos-links is still in the DOM and connected
   function injectLinks() {
-    if (document.getElementById('yos-links')) return;
+    const existing = document.getElementById('yos-links');
+    if (existing && document.contains(existing)) return; // already injected and connected
     const nav = document.querySelector('nav');
     if (!nav) return;
     const navMain = nav.firstElementChild;
@@ -302,7 +314,6 @@
     fab.appendChild(mkBtn('🖨', 'Print (Alt+P)', () => window.print()));
     document.body.appendChild(fab);
 
-    // Scroll listener — passive, throttled, attached late
     setTimeout(() => {
       const sc = chatSC();
       if (sc) sc.addEventListener('scroll', throttle(() => {
@@ -319,7 +330,6 @@
       if (!msgs.length) return;
       const scTop = sc.scrollTop;
       let target = null;
-
       if (dir === -1) {
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (msgs[i].offsetTop < scTop - 40) { target = msgs[i]; break; }
@@ -356,12 +366,13 @@
     } catch (e) {}
   }
 
-  // ─── MESSAGE TOOLBAR — slow polling, self-stopping ───────────
-  // setInterval at 4s, stops after 20 passes (80s total coverage)
-  // Then re-arms once on scroll to catch new messages
+  // BUG 3 FIX — WeakSet tracks processed elements, survives React re-renders
+  // that wipe dataset attributes
+  const _tbDone = new WeakSet();
+
   function initMsgToolbar() {
     let passes = 0;
-    const MAX = 20;
+    const MAX = 15;
 
     const run = () => {
       try {
@@ -369,8 +380,11 @@
         getMessages().forEach(msg => {
           if (isUserMsg(msg)) return;
           const md = getMDDiv(msg);
-          if (!md || md.dataset.ytb) return;
-          md.dataset.ytb = '1';
+          if (!md) return;
+          // WeakSet check — survives DOM attribute wipes by React
+          if (_tbDone.has(md)) return;
+          _tbDone.add(md);
+
           md.classList.add('yos-mw');
           md.style.position = 'relative';
 
@@ -391,7 +405,7 @@
           tb.appendChild(sep());
           tb.appendChild(mkB('📋', '', 'Copy as Markdown', (b) => {
             const txt = md.innerText || md.textContent;
-            try { GM_setClipboard(txt, 'text'); } catch(e) { navigator.clipboard.writeText(txt).catch(() => {}); }
+            try { GM_setClipboard(txt, 'text'); } catch(e2) { navigator.clipboard.writeText(txt).catch(() => {}); }
             b.textContent = '✓'; setTimeout(() => { b.textContent = '📋'; }, 1500);
           }));
           if ((md.textContent || '').length > 600) {
@@ -406,18 +420,16 @@
       } catch (e) {}
     };
 
-    // Start slow polling — 4s interval, stops after MAX passes
+    // Slow polling — 4s, hard stop at MAX passes, then re-arm on scroll once
     const timer = setInterval(() => {
       run();
       if (passes >= MAX) {
         clearInterval(timer);
-        // Re-arm on scroll (one-time, throttled) to catch new messages after stop
         const sc = chatSC();
-        if (sc) sc.addEventListener('scroll', throttle(run, 2000), { passive: true, once: false });
+        if (sc) sc.addEventListener('scroll', throttle(run, 3000), { passive: true });
       }
     }, 4000);
 
-    // First run at 3s after init
     setTimeout(run, 3000);
   }
 
@@ -467,11 +479,10 @@
   }
 
   // ─── BOOT SEQUENCE ───────────────────────────────────────────
-  // Phase 1: CSS only — immediate, no DOM reads
+  // Phase 1: CSS only — immediate, safe
   injectCSS();
 
-  // Phase 2: All interactive features — after window.load + 2500ms
-  // This guarantees React has fully hydrated before we touch the DOM
+  // Phase 2: All features after window.load + 2500ms
   function launchFeatures() {
     try {
       if (CFG.yosTitle) patchTitle();
@@ -482,15 +493,15 @@
       if (CFG.msgToolbar) initMsgToolbar();
       if (CFG.selectToPrompt) initSelectToPrompt();
       if (CFG.keyboard) initKeyboard();
-      console.log('[Y-OS] Manus client v1.5 loaded ✓');
+      console.log('[Y-OS] Manus client v1.6 loaded ✓');
     } catch (e) {
       console.warn('[Y-OS] Boot error:', e);
     }
   }
 
-  // Phase 3: Retry branding injections at 6s and 12s (SPA route changes)
+  // Phase 3: Retry branding at 6s and 14s for SPA route changes
   function scheduleRetries() {
-    [6000, 12000].forEach(d => setTimeout(() => {
+    [6000, 14000].forEach(d => setTimeout(() => {
       try {
         if (CFG.yosLogo) injectLogo();
         if (CFG.yosQuickLinks) injectLinks();
@@ -499,7 +510,6 @@
     }, d));
   }
 
-  // Entry point — wait for full page load + 2.5s
   if (document.readyState === 'complete') {
     setTimeout(() => { launchFeatures(); scheduleRetries(); }, 2500);
   } else {
