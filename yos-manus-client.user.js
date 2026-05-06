@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Y-OS Manus Client
 // @namespace    https://yos.ai
-// @version      1.3.0
+// @version      1.4.0
 // @description  Y-OS custom client for manus.im — cleanup, branding, navigation, message toolbar
 // @author       Yannick Jolliet / Y-OS
 // @match        https://manus.im/*
@@ -12,6 +12,18 @@
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
+
+/**
+ * v1.4.0 — Performance fix
+ * ROOT CAUSE of freeze: setInterval(800ms) calling getBoundingClientRect() on every message
+ * → forced synchronous layout reflow on every tick → CPU 100% on long conversations
+ *
+ * FIX:
+ * - Toolbar: IntersectionObserver (zero reflow, fires only when element enters viewport)
+ * - colorProjects: no MutationObserver, only 3 deferred retries
+ * - navQ: cached rects, no live getBoundingClientRect in loop
+ * - All DOM writes batched, no reads inside write loops
+ */
 
 (function () {
   'use strict';
@@ -61,6 +73,8 @@
   let _css = '';
   function addCSS(css) { _css += css + '\n'; }
   function flushCSS() {
+    const existing = document.getElementById('yos-styles');
+    if (existing) existing.remove();
     const s = document.createElement('style');
     s.id = 'yos-styles';
     s.textContent = _css;
@@ -68,20 +82,24 @@
   }
 
   function throttle(fn, ms) {
-    let last = 0;
+    let t = null;
     return (...args) => {
-      const now = Date.now();
-      if (now - last >= ms) { last = now; fn(...args); }
+      if (!t) { t = setTimeout(() => { t = null; fn(...args); }, ms); }
     };
   }
 
+  // Chat scroll container — cached
+  let _sc = null;
   function chatSC() {
+    if (_sc && document.contains(_sc)) return _sc;
     const all = document.querySelectorAll('.simplebar-content-wrapper');
     let best = null;
-    all.forEach(el => { if (el.getBoundingClientRect().left >= 260) best = el; });
-    return best || document.querySelector('main') || document.documentElement;
+    all.forEach(el => { if (el.getBoundingClientRect().left >= 200) best = el; });
+    _sc = best || document.querySelector('main') || document.documentElement;
+    return _sc;
   }
 
+  // Get message list — reads DOM structure once
   function getMessages() {
     const sc = chatSC();
     if (!sc) return [];
@@ -127,6 +145,7 @@
 
   // ─── MODULE 1 — CLEANUP (pure CSS, zero observers) ───────────
   function initCleanup() {
+    // Meta logo: the last flex-col items-start div in the nav bottom section
     addCSS(`
       nav > div > div:last-child div[class*="flex-col"][class*="items-start"] { display:none!important; }
       nav > div > div:last-child > div:first-child > button { display:none!important; }
@@ -149,7 +168,6 @@
         }
       `);
     }
-
     if (CFG.yosLogo) injectLogo();
     if (CFG.yosTitle) patchTitle();
     if (CFG.yosQuickLinks) injectLinks();
@@ -194,7 +212,6 @@
   function patchTitle() {
     const fix = () => { if (!document.title.startsWith('Y-OS')) document.title = document.title.replace(/\bManus\b/g, 'Y-OS'); };
     fix();
-    // Only observe <title> — very low overhead
     const t = document.querySelector('title');
     if (t) new MutationObserver(fix).observe(t, { childList: true });
   }
@@ -222,6 +239,7 @@
     menuSection.insertBefore(wrap, menuSection.firstChild);
   }
 
+  // colorProjects — NO MutationObserver, only deferred retries
   function colorProjects() {
     const run = () => {
       const nav = document.querySelector('nav');
@@ -237,15 +255,8 @@
         });
       });
     };
-    run();
-    setTimeout(run, 2000);
-    setTimeout(run, 6000);
-    // Nav-scoped observer with throttle — much lighter than body observer
-    const nav = document.querySelector('nav');
-    if (nav) {
-      const obs = new MutationObserver(throttle(run, 1500));
-      obs.observe(nav, { childList: true, subtree: true });
-    }
+    // Run at 3 safe moments — no observer
+    [500, 2500, 7000].forEach(d => setTimeout(run, d));
   }
 
   // ─── MODULE 3 — FAB NAVIGATION ───────────────────────────────
@@ -269,10 +280,14 @@
       return b;
     };
 
-    const btnTop = mkBtn('↑', 'Back to top (Alt+T)', () => { const s = chatSC(); if (s) s.scrollTo({ top: 0, behavior: 'smooth' }); });
+    const btnTop = mkBtn('↑', 'Back to top (Alt+T)', () => {
+      const s = chatSC(); if (s) s.scrollTo({ top: 0, behavior: 'smooth' });
+    });
     btnTop.dataset.h = '1';
     fab.appendChild(btnTop);
-    fab.appendChild(mkBtn('↓', 'Scroll to bottom (Alt+B)', () => { const s = chatSC(); if (s) s.scrollTop = s.scrollHeight; }));
+    fab.appendChild(mkBtn('↓', 'Scroll to bottom (Alt+B)', () => {
+      const s = chatSC(); if (s) s.scrollTop = s.scrollHeight;
+    }));
     fab.appendChild(mkBtn('⬆', 'Previous question (Alt+↑)', () => navQ(-1)));
     fab.appendChild(mkBtn('⬇', 'Next question (Alt+↓)', () => navQ(1)));
 
@@ -281,44 +296,43 @@
       b.classList.add('wide'); fab.appendChild(b);
     }
     fab.appendChild(mkBtn('🖨', 'Print (Alt+P)', () => window.print()));
-
     document.body.appendChild(fab);
 
+    // Scroll listener — passive, throttled
     setTimeout(() => {
       const sc = chatSC();
       if (sc) sc.addEventListener('scroll', throttle(() => {
         btnTop.dataset.h = sc.scrollTop > 300 ? '0' : '1';
-      }, 200), { passive: true });
+      }, 300), { passive: true });
     }, 3000);
   }
 
+  // navQ — NO getBoundingClientRect in loop, uses offsetTop instead
   function navQ(dir) {
     const sc = chatSC();
     if (!sc) return;
     const msgs = getMessages().filter(isUserMsg);
     if (!msgs.length) return;
-    const scRect = sc.getBoundingClientRect();
-    const cur = sc.scrollTop;
+
+    // Use offsetTop relative to scroll container — no forced reflow
+    const scTop = sc.scrollTop;
     let target = null;
 
     if (dir === -1) {
       for (let i = msgs.length - 1; i >= 0; i--) {
-        const top = msgs[i].getBoundingClientRect().top - scRect.top + cur;
-        if (top < cur - 40) { target = msgs[i]; break; }
+        const elTop = msgs[i].offsetTop;
+        if (elTop < scTop - 40) { target = msgs[i]; break; }
       }
       if (!target) target = msgs[0];
     } else {
       for (let i = 0; i < msgs.length; i++) {
-        const top = msgs[i].getBoundingClientRect().top - scRect.top + cur;
-        if (top > cur + 60) { target = msgs[i]; break; }
+        const elTop = msgs[i].offsetTop;
+        if (elTop > scTop + 60) { target = msgs[i]; break; }
       }
       if (!target) target = msgs[msgs.length - 1];
     }
 
-    if (target) {
-      const top = target.getBoundingClientRect().top - scRect.top + cur - 20;
-      sc.scrollTo({ top, behavior: 'smooth' });
-    }
+    if (target) sc.scrollTo({ top: target.offsetTop - 20, behavior: 'smooth' });
   }
 
   function exportMD() {
@@ -340,7 +354,9 @@
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
   }
 
-  // ─── MODULE 4 — MESSAGE TOOLBAR (polling, NOT MutationObserver) ─
+  // ─── MODULE 4 — MESSAGE TOOLBAR ──────────────────────────────
+  // Uses IntersectionObserver — fires ONLY when element enters viewport
+  // Zero polling, zero reflow, zero CPU when not scrolling
   function initMsgToolbar() {
     if (!CFG.msgToolbar) return;
 
@@ -356,9 +372,13 @@
       .yos-col::after{content:'';position:absolute;bottom:0;left:0;right:0;height:32px;background:linear-gradient(transparent,#111318);pointer-events:none;}
     `);
 
-    // POLLING every 800ms — safe, no feedback loop
-    setInterval(() => {
-      getMessages().forEach(msg => {
+    // IntersectionObserver: processes each message element once when it enters viewport
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (!entry.isIntersecting) return;
+        const msg = entry.target;
+        io.unobserve(msg); // process once only
+
         if (isUserMsg(msg)) return;
         const md = getMDDiv(msg);
         if (!md || md.dataset.ytb) return;
@@ -381,7 +401,6 @@
         tb.appendChild(mkB('❌', 'no', 'Incorrect — fix', () => prefillInput('❌ Non, corrige ce point : ')));
         tb.appendChild(mkB('⚠️', 'wn', 'Partially correct', () => prefillInput('⚠️ Partiellement correct, précise : ')));
         tb.appendChild(sep());
-
         tb.appendChild(mkB('📋', '', 'Copy as Markdown', (b) => {
           const txt = md.innerText || md.textContent;
           try { GM_setClipboard(txt, 'text'); } catch(e) { navigator.clipboard.writeText(txt).catch(() => {}); }
@@ -395,10 +414,36 @@
             b.textContent = col ? '⤡' : '⤢'; b.title = col ? 'Expand' : 'Collapse';
           }));
         }
-
         md.appendChild(tb);
       });
-    }, 800);
+    }, { threshold: 0.1 });
+
+    // Watch for new message elements — scoped to chat container only
+    // Use a lightweight MutationObserver on the messages container (not body)
+    function observeMessages() {
+      const msgs = getMessages();
+      msgs.forEach(m => { if (!m.dataset.yio) { m.dataset.yio = '1'; io.observe(m); } });
+    }
+
+    // Initial pass + deferred for SPA
+    [500, 2000, 5000].forEach(d => setTimeout(observeMessages, d));
+
+    // Scoped MutationObserver — only on the messages container, childList only (no subtree, no attributes)
+    setTimeout(() => {
+      const sc = chatSC();
+      if (!sc) return;
+      const content = sc.querySelector('.simplebar-content');
+      if (!content) return;
+      const main = content.firstElementChild;
+      if (!main || main.children.length < 2) return;
+      const mx = main.children[1];
+      if (!mx || !mx.firstElementChild) return;
+      const outer = mx.firstElementChild.firstElementChild;
+      if (!outer) return;
+
+      // Only childList on the direct message container — fires when new messages added
+      new MutationObserver(throttle(observeMessages, 500)).observe(outer, { childList: true });
+    }, 3000);
   }
 
   // ─── MODULE 5 — SELECT TO PROMPT ─────────────────────────────
@@ -448,14 +493,14 @@
     });
   }
 
-  // ─── DEFERRED INIT (retry for SPA late render) ───────────────
-  // Run branding injections at 1s, 3s, 8s after load — covers SPA route changes
+  // ─── DEFERRED RETRY (SPA route changes) ──────────────────────
   function deferredRetry() {
-    [1000, 3000, 8000].forEach(delay => {
+    [1000, 3500, 9000].forEach(delay => {
       setTimeout(() => {
         if (CFG.yosLogo) injectLogo();
         if (CFG.yosQuickLinks) injectLinks();
         if (CFG.projectColors) colorProjects();
+        _sc = null; // reset cached scroll container on route change
       }, delay);
     });
   }
@@ -470,7 +515,7 @@
     initSelectToPrompt();
     initKeyboard();
     deferredRetry();
-    console.log('[Y-OS] Manus client v1.3 loaded ✓');
+    console.log('[Y-OS] Manus client v1.4 loaded ✓');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
