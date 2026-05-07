@@ -1,20 +1,22 @@
 // ==UserScript==
 // @name         Y-OS Manus Client
 // @namespace    https://yos.ai
-// @version      1.8.0
+// @version      1.9.0
 // @description  Y-OS custom client for manus.im — cleanup, branding, navigation, message toolbar, project navigator
 // @author       Yannick Jolliet / Y-OS
 // @match        https://manus.im/*
+// @match        https://manus.im/app*
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
+// @grant        unsafeWindow
 // @updateURL    https://raw.githubusercontent.com/yj000018/yos-manus-client/main/yos-manus-client.user.js
 // @downloadURL  https://raw.githubusercontent.com/yj000018/yos-manus-client/main/yos-manus-client.user.js
-// @run-at       document-idle
+// @run-at       document-start
 // @noframes
 // ==/UserScript==
 
 /**
- * v1.8.0 — Project Navigator
+ * v1.9.0 — document-start + unsafeWindow + multi-match
  *
  * NEW in v1.8:
  * - Intercepts manus.im native fetch() calls to capture project/task data
