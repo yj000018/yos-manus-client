@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Y-OS Manus Client
 // @namespace    https://yos.ai
-// @version      1.7.0
-// @description  Y-OS custom client for manus.im — cleanup, branding, navigation, message toolbar
+// @version      1.8.0
+// @description  Y-OS custom client for manus.im — cleanup, branding, navigation, message toolbar, project navigator
 // @author       Yannick Jolliet / Y-OS
 // @match        https://manus.im/*
 // @grant        GM_addStyle
@@ -14,15 +14,21 @@
 // ==/UserScript==
 
 /**
- * v1.7.0 — Rewrite with robust selectors + debug logging
+ * v1.8.0 — Project Navigator
  *
- * KEY CHANGES vs v1.6:
- * - CSS cleanup: content-based selectors (SVG viewBox, text content) instead of fragile structural chains
- * - Logo: injected as fixed overlay on nav, not inside React-managed DOM
- * - Messages: broad selector scan (prose/markdown classes) with fallback
- * - chatSC(): multiple fallback strategies
- * - Full debug logging: every step logged to console
- * - All features individually guarded with try/catch + log
+ * NEW in v1.8:
+ * - Intercepts manus.im native fetch() calls to capture project/task data
+ * - Project Navigator panel: 📁 button → drawer with projects → sessions → navigate
+ * - Instant client-side search across all session titles
+ * - localStorage cache (1h TTL) — zero extra network calls
+ * - Session title badge: [ProjectName] appended in navigator
+ *
+ * STABILITY (from v1.7):
+ * - All features deferred 2500ms after window.load
+ * - WeakSet for toolbar tracking (survives React re-renders)
+ * - patchTitle: _patching flag prevents MutationObserver loop
+ * - injectLinks: document.contains() check prevents re-injection loop
+ * - CSS: content-based selectors only
  */
 
 (function () {
@@ -41,6 +47,7 @@
     yosTitle:         true,
     yosQuickLinks:    true,
     projectColors:    true,
+    projectNavigator: true,
     fabNav:           true,
     exportMD:         true,
     msgToolbar:       true,
@@ -51,6 +58,7 @@
   // ─── DESIGN TOKENS ───────────────────────────────────────────
   const C = {
     bgNav:    '#0d0f14',
+    bgPanel:  '#111318',
     accent:   '#7c3aed',
     accentDim:'#4c1d95',
     text:     '#e8eaf0',
@@ -60,7 +68,8 @@
     no:       '#ef4444',
     warn:     '#f59e0b',
     palette:  ['#7c3aed','#2563eb','#059669','#d97706','#dc2626',
-               '#0891b2','#db2777','#65a30d','#9333ea','#0d9488'],
+               '#0891b2','#db2777','#65a30d','#9333ea','#0d9488',
+               '#7c2d12','#1e40af','#065f46','#92400e','#991b1b'],
     links: [
       { label: '🧠 Notion',       url: 'https://notion.so' },
       { label: '🚀 Lovable',      url: 'https://lovable.dev' },
@@ -72,292 +81,832 @@
     ],
   };
 
+  // ─── UTILS ───────────────────────────────────────────────────
+  function throttle(fn, ms) {
+    let t = 0;
+    return (...a) => { const n = Date.now(); if (n - t > ms) { t = n; fn(...a); } };
+  }
+
+  function chatSC() {
+    // Strategy 1: simplebar-content-wrapper
+    const sb = document.querySelector('.simplebar-content-wrapper');
+    if (sb && sb.scrollHeight > sb.clientHeight) return sb;
+    // Strategy 2: largest scrollable div not in nav
+    const all = Array.from(document.querySelectorAll('div'));
+    let best = null;
+    for (const el of all) {
+      if (el.closest('nav') || el.closest('aside')) continue;
+      if (el.scrollHeight > el.clientHeight + 100) {
+        if (!best || el.scrollHeight > best.scrollHeight) best = el;
+      }
+    }
+    if (best) return best;
+    // Strategy 3: main element
+    return document.querySelector('main') || document.documentElement;
+  }
+
+  function getMessages() {
+    // Strategy 1: data-message-id attributes
+    const byAttr = document.querySelectorAll('[data-message-id]');
+    if (byAttr.length > 0) return Array.from(byAttr);
+    // Strategy 2: prose/markdown containers
+    const byClass = document.querySelectorAll('[class*="prose"],[class*="markdown"],[class*="message"]');
+    if (byClass.length > 0) return Array.from(byClass);
+    // Strategy 3: broad scan
+    return Array.from(document.querySelectorAll('div[class]')).filter(el => {
+      const c = el.className;
+      return (c.includes('prose') || c.includes('markdown') || c.includes('message') || c.includes('chat'));
+    });
+  }
+
+  function isUserMsg(el) {
+    const c = el.className || '';
+    if (c.includes('user') || c.includes('human') || c.includes('right')) return true;
+    const txt = el.textContent?.trim() || '';
+    if (el.querySelector('[class*="prose"],[class*="markdown"]')) return false;
+    return txt.length < 500 && !el.querySelector('h1,h2,h3,ul,ol,pre,code,table');
+  }
+
+  function getMDDiv(el) {
+    return el.querySelector('[class*="prose"],[class*="markdown"]') ||
+           (el.className?.includes('prose') || el.className?.includes('markdown') ? el : null);
+  }
+
+  function sendMsg(text) {
+    const ta = document.querySelector('textarea');
+    if (!ta) return;
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    nativeInputValueSetter.call(ta, text);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    setTimeout(() => {
+      const btn = document.querySelector('button[type="submit"],button[aria-label*="send" i],button[aria-label*="Send" i]');
+      if (btn) btn.click();
+    }, 100);
+  }
+
+  function prefillInput(text) {
+    const ta = document.querySelector('textarea');
+    if (!ta) return;
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    nativeInputValueSetter.call(ta, text);
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    ta.focus();
+    ta.setSelectionRange(text.length, text.length);
+  }
+
   // ─── CSS ─────────────────────────────────────────────────────
   function injectCSS() {
     if (document.getElementById('yos-styles')) return;
     const css = `
       /* === CLEANUP === */
-      /* Meta logo: SVG with viewBox 0 0 107 12 — hide its container */
+      /* Meta logo: SVG with viewBox 0 0 107 12 */
       svg[viewBox="0 0 107 12"] { display:none!important; }
-      /* "from" text next to Meta logo */
-      svg[viewBox="0 0 107 12"] ~ * { display:none!important; }
-      /* Parent wrapper of Meta logo */
+      svg[viewBox="0 0 107 12"] + * { display:none!important; }
+      /* Container of Meta logo — has "from" text + SVG */
       :has(> svg[viewBox="0 0 107 12"]) { display:none!important; }
 
-      /* Share sidebar button — hide button containing "Share Manus" text */
-      /* We target via a broad approach: any button in nav bottom area */
-      nav button[class*="rounded"][class*="gap"] { display:none!important; }
+      /* Share sidebar button — contains "Share Manus" text */
+      button:has([class*="gift"]),
+      a:has([class*="gift"]),
+      div[class*="referral"],
+      div[class*="share-sidebar"] { display:none!important; }
 
       /* Cloud computers button */
-      button[data-testid="cloud-computers-button"],
-      button[aria-label*="Cloud"],
-      button[aria-label*="computer"] { display:none!important; }
+      button[class*="cloud"],
+      a[class*="cloud"] { display:none!important; }
 
-      /* === BRANDING === */
-      nav { background-color:${C.bgNav}!important; }
-      ::-webkit-scrollbar { width:4px; height:4px; }
-      ::-webkit-scrollbar-track { background:transparent; }
-      ::-webkit-scrollbar-thumb { background:${C.accentDim}; border-radius:2px; }
-      ::-webkit-scrollbar-thumb:hover { background:${C.accent}; }
+      /* === Y-OS COLORS === */
+      :root {
+        --yos-bg-nav: #0d0f14;
+        --yos-accent: #7c3aed;
+        --yos-text: #e8eaf0;
+        --yos-border: #1e2230;
+      }
+
+      /* === LOGO === */
+      #yos-logo-badge {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        z-index: 9999;
+        pointer-events: none;
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 15px;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+        background: linear-gradient(135deg, #7c3aed, #a855f7);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        user-select: none;
+        line-height: 1;
+      }
+
+      /* === QUICK LINKS === */
+      #yos-links {
+        padding: 8px 8px 4px;
+        border-top: 1px solid #1e2230;
+        margin-top: 4px;
+      }
+      #yos-links .yos-lbl {
+        font-size: 10px;
+        color: #8b90a0;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        padding: 0 4px 4px;
+        font-family: system-ui, sans-serif;
+      }
+      #yos-links a {
+        display: block;
+        padding: 5px 8px;
+        border-radius: 6px;
+        font-size: 12px;
+        color: #c4c9d8;
+        text-decoration: none;
+        font-family: system-ui, sans-serif;
+        transition: background 0.15s;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #yos-links a:hover { background: #1e2230; color: #e8eaf0; }
+
+      /* === PROJECT NAVIGATOR === */
+      #yos-proj-btn {
+        position: fixed;
+        bottom: 80px;
+        right: 16px;
+        z-index: 9998;
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: #1e2230;
+        border: 1px solid #7c3aed;
+        color: #e8eaf0;
+        font-size: 16px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 2px 12px rgba(124,58,237,.3);
+        transition: transform 0.15s, background 0.15s;
+      }
+      #yos-proj-btn:hover { transform: scale(1.1); background: #7c3aed; }
+
+      #yos-proj-drawer {
+        position: fixed;
+        top: 0;
+        right: -360px;
+        width: 340px;
+        height: 100vh;
+        background: #111318;
+        border-left: 1px solid #1e2230;
+        z-index: 99999;
+        display: flex;
+        flex-direction: column;
+        transition: right 0.25s cubic-bezier(.4,0,.2,1);
+        font-family: system-ui, -apple-system, sans-serif;
+        box-shadow: -4px 0 24px rgba(0,0,0,.5);
+      }
+      #yos-proj-drawer.open { right: 0; }
+
+      #yos-proj-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 16px 12px;
+        border-bottom: 1px solid #1e2230;
+        flex-shrink: 0;
+      }
+      #yos-proj-header h2 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 700;
+        color: #e8eaf0;
+        letter-spacing: -0.2px;
+      }
+      #yos-proj-close {
+        background: none;
+        border: none;
+        color: #8b90a0;
+        cursor: pointer;
+        font-size: 18px;
+        padding: 0 4px;
+        line-height: 1;
+      }
+      #yos-proj-close:hover { color: #e8eaf0; }
+
+      #yos-proj-search {
+        margin: 10px 12px;
+        padding: 7px 12px;
+        background: #0d0f14;
+        border: 1px solid #1e2230;
+        border-radius: 8px;
+        color: #e8eaf0;
+        font-size: 12px;
+        outline: none;
+        flex-shrink: 0;
+        font-family: system-ui, sans-serif;
+      }
+      #yos-proj-search:focus { border-color: #7c3aed; }
+
+      #yos-proj-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0 8px 16px;
+      }
+      #yos-proj-list::-webkit-scrollbar { width: 4px; }
+      #yos-proj-list::-webkit-scrollbar-track { background: transparent; }
+      #yos-proj-list::-webkit-scrollbar-thumb { background: #1e2230; border-radius: 2px; }
+
+      .yos-proj-group {
+        margin-bottom: 8px;
+        border-radius: 8px;
+        overflow: hidden;
+        border: 1px solid #1e2230;
+      }
+      .yos-proj-group-hdr {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 12px;
+        cursor: pointer;
+        user-select: none;
+        transition: background 0.12s;
+      }
+      .yos-proj-group-hdr:hover { background: #1a1d26; }
+      .yos-proj-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .yos-proj-name {
+        flex: 1;
+        font-size: 12px;
+        font-weight: 600;
+        color: #e8eaf0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .yos-proj-count {
+        font-size: 10px;
+        color: #8b90a0;
+        background: #0d0f14;
+        padding: 1px 6px;
+        border-radius: 10px;
+      }
+      .yos-proj-chevron {
+        font-size: 10px;
+        color: #8b90a0;
+        transition: transform 0.15s;
+      }
+      .yos-proj-group.expanded .yos-proj-chevron { transform: rotate(90deg); }
+
+      .yos-proj-sessions {
+        display: none;
+        border-top: 1px solid #1e2230;
+        background: #0d0f14;
+      }
+      .yos-proj-group.expanded .yos-proj-sessions { display: block; }
+
+      .yos-session-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 12px 7px 28px;
+        cursor: pointer;
+        border-bottom: 1px solid #13151c;
+        transition: background 0.1s;
+      }
+      .yos-session-item:last-child { border-bottom: none; }
+      .yos-session-item:hover { background: #1a1d26; }
+      .yos-session-title {
+        flex: 1;
+        font-size: 11px;
+        color: #c4c9d8;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        line-height: 1.3;
+      }
+      .yos-session-date {
+        font-size: 10px;
+        color: #8b90a0;
+        flex-shrink: 0;
+      }
+      .yos-session-item.current .yos-session-title { color: #a78bfa; font-weight: 600; }
+
+      .yos-proj-unassigned .yos-proj-dot { background: #374151; }
+
+      #yos-proj-footer {
+        padding: 10px 12px;
+        border-top: 1px solid #1e2230;
+        font-size: 10px;
+        color: #8b90a0;
+        flex-shrink: 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      #yos-proj-refresh {
+        background: none;
+        border: 1px solid #1e2230;
+        border-radius: 4px;
+        color: #8b90a0;
+        cursor: pointer;
+        font-size: 10px;
+        padding: 2px 8px;
+      }
+      #yos-proj-refresh:hover { color: #e8eaf0; border-color: #7c3aed; }
 
       /* === FAB === */
-      #yos-fab{position:fixed;right:14px;bottom:100px;z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none;}
-      .yb{width:32px;height:32px;border-radius:50%;background:${C.bgNav};border:1px solid ${C.border};color:${C.text};font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;pointer-events:all;transition:all .15s;box-shadow:0 2px 8px rgba(0,0,0,.6);opacity:.65;user-select:none;font-family:system-ui,sans-serif;line-height:1;}
-      .yb:hover{background:${C.accentDim};border-color:${C.accent};opacity:1;transform:scale(1.12);}
-      .yb.wide{border-radius:8px;width:38px;font-size:9px;font-weight:700;}
-      .yb-hidden{opacity:0!important;pointer-events:none!important;}
+      #yos-fab {
+        position: fixed;
+        bottom: 16px;
+        right: 16px;
+        z-index: 9997;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        align-items: flex-end;
+      }
+      .yos-fab-btn {
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        background: #1e2230;
+        border: 1px solid #2a2f42;
+        color: #c4c9d8;
+        font-size: 14px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: transform 0.12s, background 0.12s;
+        position: relative;
+      }
+      .yos-fab-btn:hover { transform: scale(1.12); background: #7c3aed; color: #fff; }
+      .yos-fab-btn::after {
+        content: attr(data-tip);
+        position: absolute;
+        right: 44px;
+        background: #0d0f14;
+        border: 1px solid #1e2230;
+        color: #e8eaf0;
+        font-size: 11px;
+        padding: 3px 8px;
+        border-radius: 5px;
+        white-space: nowrap;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.15s;
+        font-family: system-ui, sans-serif;
+      }
+      .yos-fab-btn:hover::after { opacity: 1; }
 
       /* === MESSAGE TOOLBAR === */
-      .yos-mw{position:relative;}
-      .yos-tb{display:none;position:absolute;top:-36px;right:0;background:${C.bgNav};border:1px solid ${C.border};border-radius:8px;padding:3px 6px;gap:2px;align-items:center;z-index:1000;box-shadow:0 2px 12px rgba(0,0,0,.6);white-space:nowrap;}
-      .yos-mw:hover .yos-tb{display:flex!important;}
-      .ytb{background:transparent;border:none;color:${C.textDim};font-size:13px;cursor:pointer;padding:2px 5px;border-radius:4px;transition:all .1s;line-height:1.2;font-family:system-ui,sans-serif;}
-      .ytb:hover{background:rgba(124,58,237,.15);color:${C.text};}
-      .ytb.ok:hover{color:${C.ok};} .ytb.no:hover{color:${C.no};} .ytb.wn:hover{color:${C.warn};}
-      .ysep{width:1px;height:14px;background:${C.border};margin:0 3px;display:inline-block;}
-      .yos-col{max-height:80px;overflow:hidden;position:relative;}
-      .yos-col::after{content:'';position:absolute;bottom:0;left:0;right:0;height:32px;background:linear-gradient(transparent,#111318);pointer-events:none;}
+      .yos-mw { position: relative !important; }
+      .yos-tb {
+        position: absolute;
+        top: -28px;
+        right: 0;
+        display: none;
+        gap: 2px;
+        background: #111318;
+        border: 1px solid #1e2230;
+        border-radius: 8px;
+        padding: 3px 4px;
+        z-index: 100;
+        box-shadow: 0 2px 12px rgba(0,0,0,.4);
+      }
+      .yos-mw:hover .yos-tb { display: flex; }
+      .ytb {
+        background: none;
+        border: none;
+        cursor: pointer;
+        font-size: 13px;
+        padding: 2px 5px;
+        border-radius: 4px;
+        transition: background 0.1s;
+        line-height: 1;
+      }
+      .ytb:hover { background: #1e2230; }
+      .ysep { width: 1px; background: #1e2230; margin: 2px 3px; }
+      .yos-col { max-height: 200px; overflow: hidden; }
+      .yos-col::after {
+        content: '';
+        position: absolute;
+        bottom: 0; left: 0; right: 0;
+        height: 60px;
+        background: linear-gradient(transparent, #111318);
+        pointer-events: none;
+      }
 
       /* === PRINT === */
       @media print {
-        nav, #yos-fab, #yos-tip { display:none!important; }
-        body { background:#fff!important; color:#000!important; }
+        nav, aside, #yos-fab, #yos-proj-btn, #yos-proj-drawer { display: none !important; }
+        .yos-tb { display: none !important; }
       }
     `;
-    const s = document.createElement('style');
-    s.id = 'yos-styles';
-    s.textContent = css;
-    (document.head || document.documentElement).appendChild(s);
+    const style = document.createElement('style');
+    style.id = 'yos-styles';
+    style.textContent = css;
+    document.head.appendChild(style);
     LOG('CSS injected');
   }
 
-  // ─── UTILS ───────────────────────────────────────────────────
-  function throttle(fn, ms) {
-    let t = null;
-    return (...args) => { if (!t) { t = setTimeout(() => { t = null; fn(...args); }, ms); } };
-  }
-
-  // chatSC — multiple fallback strategies, no getBoundingClientRect
-  let _sc = null;
-  function chatSC() {
-    if (_sc && document.contains(_sc)) return _sc;
-    // Strategy 1: simplebar with offsetLeft > 200 (main content area)
-    const sbAll = document.querySelectorAll('.simplebar-content-wrapper');
-    for (const el of sbAll) {
-      if (el.offsetLeft >= 200) { _sc = el; return _sc; }
-    }
-    // Strategy 2: any simplebar that's not the nav
-    for (const el of sbAll) {
-      if (!el.closest('nav')) { _sc = el; return _sc; }
-    }
-    // Strategy 3: main element
-    const main = document.querySelector('main');
-    if (main) { _sc = main; return _sc; }
-    // Strategy 4: documentElement
-    _sc = document.documentElement;
-    return _sc;
-  }
-
-  // Message detection — broad approach
-  function getMessages() {
-    try {
-      const sc = chatSC();
-      if (!sc) return [];
-      // Try to find the message container via multiple strategies
-      const content = sc.querySelector('.simplebar-content') || sc;
-
-      // Strategy 1: look for elements with role="listitem" or data-message
-      const byRole = content.querySelectorAll('[role="listitem"]');
-      if (byRole.length > 0) return [...byRole];
-
-      // Strategy 2: look for direct children of the main message wrapper
-      // Find the deepest container that has multiple children (messages)
-      const candidates = content.querySelectorAll('div > div > div > div');
-      for (const c of candidates) {
-        if (c.children.length >= 3 && c.clientHeight > 200) {
-          return [...c.children];
-        }
-      }
-
-      // Strategy 3: fallback — find all prose/markdown divs and go up 2 levels
-      const proseEls = content.querySelectorAll('[class*="prose"],[class*="markdown"],[class*="max-w-none"]');
-      if (proseEls.length > 0) {
-        const parents = new Set();
-        proseEls.forEach(el => {
-          const p = el.parentElement?.parentElement;
-          if (p) parents.add(p);
-        });
-        return [...parents];
-      }
-      return [];
-    } catch (e) { ERR('getMessages', e); return []; }
-  }
-
-  function isUserMsg(el) {
-    try {
-      // User messages typically have right-aligned content
-      return !!el.querySelector('[class*="items-end"]') ||
-             !!el.querySelector('[class*="justify-end"]') ||
-             el.textContent.trim().length < 500; // heuristic: user msgs are short
-    } catch (e) { return false; }
-  }
-
-  // Find the markdown/prose div in a message
-  function getMDDiv(el) {
-    try {
-      return el.querySelector('[class*="max-w-none"]') ||
-             el.querySelector('[class*="prose"]') ||
-             el.querySelector('[class*="markdown"]') ||
-             el.querySelector('[class*="leading-"]') ||
-             null;
-    } catch (e) { return null; }
-  }
-
-  function prefillInput(text) {
-    try {
-      const inp = document.querySelector('textarea');
-      if (!inp) return;
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
-      if (setter) setter.call(inp, text); else inp.value = text;
-      inp.dispatchEvent(new Event('input', { bubbles: true }));
-      inp.focus();
-      inp.setSelectionRange(inp.value.length, inp.value.length);
-    } catch (e) {}
-  }
-
-  function sendMsg(text) {
-    prefillInput(text);
-    setTimeout(() => {
-      try {
-        const inp = document.querySelector('textarea');
-        if (inp) inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
-      } catch (e) {}
-    }, 150);
-  }
-
   // ─── BRANDING ────────────────────────────────────────────────
-  function injectLogo() {
-    if (document.getElementById('yos-logo')) return;
-    const nav = document.querySelector('nav');
-    if (!nav) { ERR('injectLogo: no nav'); return; }
-
-    // Hide original Manus logo SVGs (not the Meta one — that's handled by CSS)
-    // Target the first SVG in nav that's NOT the Meta logo
-    const svgs = nav.querySelectorAll('svg');
-    let manusLogoSVG = null;
-    for (const svg of svgs) {
-      const vb = svg.getAttribute('viewBox') || '';
-      // Skip Meta logo (107x12), skip tiny icons
-      if (vb === '0 0 107 12') continue;
-      const w = parseFloat(svg.getAttribute('width') || '0');
-      const h = parseFloat(svg.getAttribute('height') || '0');
-      if (w > 20 && h > 10) { manusLogoSVG = svg; break; }
-    }
-
-    if (manusLogoSVG) {
-      manusLogoSVG.style.display = 'none';
-      LOG('injectLogo: original SVG hidden');
-    } else {
-      LOG('injectLogo: no original SVG found, injecting overlay');
-    }
-
-    // Inject Y-OS logo as a fixed overlay at top-left of nav
-    const logo = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    logo.id = 'yos-logo';
-    logo.setAttribute('viewBox', '0 0 72 24');
-    logo.setAttribute('width', '72');
-    logo.setAttribute('height', '24');
-    logo.style.cssText = 'position:absolute;top:14px;left:14px;z-index:100;cursor:pointer;display:block;';
-    logo.innerHTML = `
-      <defs>
-        <linearGradient id="yg" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" style="stop-color:#a78bfa"/>
-          <stop offset="100%" style="stop-color:#7c3aed"/>
-        </linearGradient>
-      </defs>
-      <path d="M2 4L9 13v7h3v-7l7-9h-3.5l-5 7-5-7Z" fill="url(#yg)"/>
-      <rect x="22" y="11" width="6" height="2.5" rx="1.25" fill="#a78bfa"/>
-      <path d="M32 4c-5 0-8 3.5-8 8s3 8 8 8 8-3.5 8-8-3-8-8-8zm0 3c3 0 5 2 5 5s-2 5-5 5-5-2-5-5 2-5 5-5z" fill="url(#yg)"/>
-      <path d="M43 4v3h8c1.5 0 2.5.8 2.5 2s-1 2-2.5 2h-5c-2.5 0-4 1.8-4 4s1.5 5 5 5h8v-3h-8c-1.5 0-2-.8-2-2s.8-1 2-1h4c3 0 5.5-2 5.5-5s-2.5-5-5.5-5z" fill="url(#yg)"/>
-    `;
-
-    // Make nav position:relative so absolute positioning works
-    nav.style.position = 'relative';
-    nav.appendChild(logo);
-    LOG('injectLogo: Y-OS logo injected');
-  }
-
-  // patchTitle — re-entrant safe
+  let _patching = false;
   function patchTitle() {
-    let _patching = false;
     const fix = () => {
       if (_patching) return;
-      if (document.title.startsWith('Y-OS')) return;
       _patching = true;
-      document.title = document.title.replace(/\bManus\b/g, 'Y-OS');
+      if (!document.title.startsWith('Y-OS')) {
+        document.title = 'Y-OS — ' + document.title.replace(/^(Manus\s*[-–|]\s*)/i, '');
+      }
       _patching = false;
     };
     fix();
     const t = document.querySelector('title');
-    if (t) new MutationObserver(fix).observe(t, { childList: true });
+    if (t) {
+      const obs = new MutationObserver(() => { if (!_patching) fix(); });
+      obs.observe(t, { childList: true });
+    }
     LOG('patchTitle done');
   }
 
-  // injectLinks — stable parent check
+  function injectLogo() {
+    if (document.getElementById('yos-logo-badge')) return;
+    const nav = document.querySelector('nav');
+    if (!nav) { LOG('injectLogo: nav not found'); return; }
+    nav.style.position = 'relative';
+    const badge = document.createElement('div');
+    badge.id = 'yos-logo-badge';
+    badge.textContent = 'Y-OS';
+    nav.appendChild(badge);
+    LOG('logo injected');
+  }
+
   function injectLinks() {
     const existing = document.getElementById('yos-links');
     if (existing && document.contains(existing)) return;
-
     const nav = document.querySelector('nav');
-    if (!nav) { ERR('injectLinks: no nav'); return; }
-
-    const navMain = nav.firstElementChild;
-    if (!navMain) { ERR('injectLinks: no navMain'); return; }
-
-    // Find the menu section (second child of navMain typically)
-    let menuSection = null;
-    if (navMain.children.length >= 2) {
-      menuSection = navMain.children[1];
-    } else {
-      menuSection = navMain; // fallback: inject directly into navMain
-    }
-
+    if (!nav) { LOG('injectLinks: nav not found'); return; }
     const wrap = document.createElement('div');
     wrap.id = 'yos-links';
-    wrap.style.cssText = 'padding:4px 8px 0;flex-shrink:0;';
-    wrap.innerHTML = `
-      <div style="padding:8px 4px 4px;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:${C.textDim};">Y-OS Tools</div>
-      ${C.links.map(l => `<a href="${l.url}" target="_blank" rel="noopener"
-        style="display:flex;align-items:center;padding:5px 8px;border-radius:8px;font-size:12px;color:${C.text};text-decoration:none;gap:6px;transition:background .15s;"
-        onmouseover="this.style.background='rgba(124,58,237,.12)'"
-        onmouseout="this.style.background='transparent'">${l.label}</a>`).join('')}
-      <div style="height:1px;background:${C.border};margin:6px 4px 0;"></div>
-    `;
-    menuSection.insertBefore(wrap, menuSection.firstChild);
-    LOG('injectLinks done, section children:', menuSection.children.length);
+    const lbl = document.createElement('div');
+    lbl.className = 'yos-lbl';
+    lbl.textContent = 'Y-OS Tools';
+    wrap.appendChild(lbl);
+    C.links.forEach(({ label, url }) => {
+      const a = document.createElement('a');
+      a.href = url; a.textContent = label; a.target = '_blank'; a.rel = 'noopener';
+      wrap.appendChild(a);
+    });
+    nav.appendChild(wrap);
+    LOG('quick links injected');
   }
 
   function colorProjects() {
-    try {
-      const nav = document.querySelector('nav');
-      if (!nav) return;
-      // Broad selector: any vertical list in nav that looks like project groups
-      const lists = nav.querySelectorAll('[class*="flex-col"][class*="gap"]');
-      let colored = 0;
-      lists.forEach(c => {
-        if (c.children.length < 2) return;
-        [...c.children].forEach((item, i) => {
-          if (item.dataset.yc) return;
-          item.dataset.yc = '1';
-          const col = C.palette[i % C.palette.length];
-          item.style.cssText += `border-left:2px solid ${col};padding-left:6px;border-radius:0 6px 6px 0;margin-bottom:1px;`;
-          const txt = item.querySelector('[class*="truncate"]') || item.querySelector('[class*="flex-1"]');
-          if (txt) { txt.style.color = col; txt.style.fontWeight = '600'; }
-          colored++;
-        });
+    const items = document.querySelectorAll('nav a[href*="/app/"]');
+    if (!items.length) { LOG('colorProjects: no items found'); return; }
+    let colored = 0;
+    items.forEach((el, i) => {
+      if (!el.dataset.yosColor) {
+        const color = C.palette[i % C.palette.length];
+        el.style.borderLeft = `2px solid ${color}`;
+        el.style.paddingLeft = '6px';
+        el.dataset.yosColor = '1';
+        colored++;
+      }
+    });
+    if (colored > 0) LOG('colorProjects: colored', colored, 'items');
+  }
+
+  // ─── PROJECT NAVIGATOR ───────────────────────────────────────
+  // Data store
+  const YOS_STORE = {
+    CACHE_KEY: 'yos_proj_index',
+    CACHE_TTL: 60 * 60 * 1000, // 1h
+
+    load() {
+      try {
+        const raw = localStorage.getItem(this.CACHE_KEY);
+        if (!raw) return null;
+        const d = JSON.parse(raw);
+        if (Date.now() - d.ts > this.CACHE_TTL) return null;
+        return d;
+      } catch { return null; }
+    },
+
+    save(projects, tasks) {
+      try {
+        localStorage.setItem(this.CACHE_KEY, JSON.stringify({
+          ts: Date.now(),
+          projects,
+          tasks,
+        }));
+        LOG('store saved:', projects.length, 'projects,', tasks.length, 'tasks');
+      } catch (e) { ERR('store save', e); }
+    },
+
+    clear() {
+      localStorage.removeItem(this.CACHE_KEY);
+      LOG('store cleared');
+    }
+  };
+
+  // Intercept native fetch to capture project/task data
+  function interceptFetch() {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = async function (...args) {
+      const res = await origFetch(...args);
+      try {
+        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+        if (url.includes('/project') || url.includes('/task')) {
+          const clone = res.clone();
+          clone.json().then(data => {
+            if (data && data.ok !== false) {
+              const cached = YOS_STORE.load() || { projects: [], tasks: [] };
+              if (url.includes('/project') && (data.projects || data.data)) {
+                const projs = data.projects || data.data || [];
+                if (projs.length > 0) {
+                  YOS_STORE.save(projs, cached.tasks);
+                  LOG('intercepted projects:', projs.length);
+                  refreshNavigator();
+                }
+              }
+              if (url.includes('/task') && !url.includes('/message') && (data.tasks || data.data)) {
+                const tasks = data.tasks || data.data || [];
+                if (tasks.length > 0) {
+                  YOS_STORE.save(cached.projects, tasks);
+                  LOG('intercepted tasks:', tasks.length);
+                  refreshNavigator();
+                }
+              }
+            }
+          }).catch(() => {});
+        }
+      } catch { }
+      return res;
+    };
+    LOG('fetch interceptor installed');
+  }
+
+  // Also intercept XHR
+  function interceptXHR() {
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+      this._yosUrl = url;
+      return origOpen.call(this, method, url, ...rest);
+    };
+    XMLHttpRequest.prototype.send = function (...args) {
+      this.addEventListener('load', function () {
+        try {
+          const url = this._yosUrl || '';
+          if ((url.includes('/project') || url.includes('/task')) && !url.includes('/message')) {
+            const data = JSON.parse(this.responseText);
+            if (data && data.ok !== false) {
+              const cached = YOS_STORE.load() || { projects: [], tasks: [] };
+              if (url.includes('/project') && (data.projects || data.data)) {
+                const projs = data.projects || data.data || [];
+                if (projs.length > 0) { YOS_STORE.save(projs, cached.tasks); refreshNavigator(); }
+              }
+              if (url.includes('/task') && (data.tasks || data.data)) {
+                const tasks = data.tasks || data.data || [];
+                if (tasks.length > 0) { YOS_STORE.save(cached.projects, tasks); refreshNavigator(); }
+              }
+            }
+          }
+        } catch { }
       });
-      if (colored > 0) LOG('colorProjects:', colored, 'items colored');
-    } catch (e) { ERR('colorProjects', e); }
+      return origSend.apply(this, args);
+    };
+    LOG('XHR interceptor installed');
+  }
+
+  // Build navigator from DOM (fallback when no API data)
+  function buildIndexFromDOM() {
+    const projects = [];
+    const tasks = [];
+    const currentUrl = window.location.href;
+
+    // Try to find project groups in sidebar
+    const navLinks = document.querySelectorAll('nav a[href*="/app/"]');
+    navLinks.forEach((el, i) => {
+      const href = el.getAttribute('href') || '';
+      const id = href.replace('/app/', '').split('/')[0];
+      if (!id) return;
+      const title = el.textContent?.trim() || `Session ${i + 1}`;
+      tasks.push({
+        id,
+        title,
+        task_url: `https://manus.im${href}`,
+        project_id: null,
+        created_at: null,
+        isCurrent: currentUrl.includes(id),
+      });
+    });
+
+    LOG('DOM index built:', tasks.length, 'sessions');
+    return { projects, tasks };
+  }
+
+  let _drawerOpen = false;
+  let _refreshNavigator = null;
+
+  function initProjectNavigator() {
+    // Install interceptors first
+    try { interceptFetch(); } catch (e) { ERR('interceptFetch', e); }
+    try { interceptXHR(); } catch (e) { ERR('interceptXHR', e); }
+
+    // Create the 📁 button
+    const btn = document.createElement('button');
+    btn.id = 'yos-proj-btn';
+    btn.title = 'Y-OS Project Navigator';
+    btn.textContent = '📁';
+    document.body.appendChild(btn);
+
+    // Create the drawer
+    const drawer = document.createElement('div');
+    drawer.id = 'yos-proj-drawer';
+    drawer.innerHTML = `
+      <div id="yos-proj-header">
+        <h2>📁 Projects</h2>
+        <button id="yos-proj-close">✕</button>
+      </div>
+      <input id="yos-proj-search" type="text" placeholder="Search sessions…" autocomplete="off" />
+      <div id="yos-proj-list"></div>
+      <div id="yos-proj-footer">
+        <span id="yos-proj-status">Loading…</span>
+        <button id="yos-proj-refresh">↻ Refresh</button>
+      </div>
+    `;
+    document.body.appendChild(drawer);
+
+    // Toggle drawer
+    btn.addEventListener('click', () => {
+      _drawerOpen = !_drawerOpen;
+      drawer.classList.toggle('open', _drawerOpen);
+      if (_drawerOpen) renderNavigator();
+    });
+
+    document.getElementById('yos-proj-close').addEventListener('click', () => {
+      _drawerOpen = false;
+      drawer.classList.remove('open');
+    });
+
+    // Close on outside click
+    document.addEventListener('click', e => {
+      if (_drawerOpen && !drawer.contains(e.target) && e.target !== btn) {
+        _drawerOpen = false;
+        drawer.classList.remove('open');
+      }
+    });
+
+    // Search
+    document.getElementById('yos-proj-search').addEventListener('input', throttle(() => {
+      renderNavigator();
+    }, 200));
+
+    // Refresh button
+    document.getElementById('yos-proj-refresh').addEventListener('click', () => {
+      YOS_STORE.clear();
+      renderNavigator(true);
+    });
+
+    _refreshNavigator = renderNavigator;
+    LOG('project navigator init');
+  }
+
+  function refreshNavigator() {
+    if (_drawerOpen && _refreshNavigator) _refreshNavigator();
+  }
+
+  function renderNavigator(forceDOM = false) {
+    const list = document.getElementById('yos-proj-list');
+    const status = document.getElementById('yos-proj-status');
+    const searchVal = (document.getElementById('yos-proj-search')?.value || '').toLowerCase().trim();
+    if (!list) return;
+
+    // Get data: cache first, then DOM
+    let cached = YOS_STORE.load();
+    let projects = cached?.projects || [];
+    let tasks = cached?.tasks || [];
+
+    if (tasks.length === 0 || forceDOM) {
+      const dom = buildIndexFromDOM();
+      if (dom.tasks.length > 0) {
+        tasks = dom.tasks;
+        projects = dom.projects;
+      }
+    }
+
+    const currentUrl = window.location.href;
+
+    // Filter by search
+    let filteredTasks = tasks;
+    if (searchVal) {
+      filteredTasks = tasks.filter(t =>
+        (t.title || '').toLowerCase().includes(searchVal) ||
+        (t.id || '').toLowerCase().includes(searchVal)
+      );
+    }
+
+    // Group by project
+    const grouped = {};
+    const unassigned = [];
+
+    projects.forEach(p => { grouped[p.id] = { project: p, sessions: [] }; });
+
+    filteredTasks.forEach(t => {
+      if (t.project_id && grouped[t.project_id]) {
+        grouped[t.project_id].sessions.push(t);
+      } else {
+        unassigned.push(t);
+      }
+    });
+
+    // Render
+    list.innerHTML = '';
+
+    // Projects with sessions
+    Object.values(grouped).forEach((g, gi) => {
+      if (g.sessions.length === 0 && searchVal) return;
+      const color = C.palette[gi % C.palette.length];
+      const grp = makeProjectGroup(g.project.name || 'Project', color, g.sessions, currentUrl, gi);
+      list.appendChild(grp);
+    });
+
+    // Unassigned sessions
+    if (unassigned.length > 0) {
+      const grp = makeProjectGroup('Unassigned', '#374151', unassigned, currentUrl, 99);
+      grp.classList.add('yos-proj-unassigned');
+      list.appendChild(grp);
+    }
+
+    if (filteredTasks.length === 0 && tasks.length === 0) {
+      list.innerHTML = '<div style="padding:20px 12px;color:#8b90a0;font-size:12px;text-align:center;">No sessions found.<br>Navigate to a session to populate.</div>';
+    }
+
+    const updatedAgo = cached ? Math.round((Date.now() - cached.ts) / 60000) + 'm ago' : 'from DOM';
+    if (status) status.textContent = `${filteredTasks.length} sessions · ${updatedAgo}`;
+  }
+
+  function makeProjectGroup(name, color, sessions, currentUrl, idx) {
+    const grp = document.createElement('div');
+    grp.className = 'yos-proj-group';
+
+    const hdr = document.createElement('div');
+    hdr.className = 'yos-proj-group-hdr';
+    hdr.innerHTML = `
+      <div class="yos-proj-dot" style="background:${color}"></div>
+      <div class="yos-proj-name">${escHtml(name)}</div>
+      <div class="yos-proj-count">${sessions.length}</div>
+      <div class="yos-proj-chevron">▶</div>
+    `;
+
+    const sessContainer = document.createElement('div');
+    sessContainer.className = 'yos-proj-sessions';
+
+    sessions.forEach(s => {
+      const item = document.createElement('div');
+      item.className = 'yos-session-item';
+      const isCurrent = currentUrl.includes(s.id) || s.isCurrent;
+      if (isCurrent) item.classList.add('current');
+
+      const dateStr = s.created_at ? new Date(s.created_at).toLocaleDateString('fr-FR', { month: 'short', day: 'numeric' }) : '';
+
+      item.innerHTML = `
+        <div class="yos-session-title">${escHtml(s.title || s.id)}</div>
+        ${dateStr ? `<div class="yos-session-date">${dateStr}</div>` : ''}
+      `;
+      item.addEventListener('click', () => {
+        const url = s.task_url || `https://manus.im/app/${s.id}`;
+        window.location.href = url;
+      });
+      sessContainer.appendChild(item);
+    });
+
+    hdr.addEventListener('click', () => {
+      grp.classList.toggle('expanded');
+    });
+
+    // Auto-expand if current session is in this group
+    if (sessions.some(s => currentUrl.includes(s.id))) {
+      grp.classList.add('expanded');
+    }
+
+    grp.appendChild(hdr);
+    grp.appendChild(sessContainer);
+    return grp;
+  }
+
+  function escHtml(str) {
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
   // ─── FAB ─────────────────────────────────────────────────────
@@ -366,38 +915,23 @@
     const fab = document.createElement('div');
     fab.id = 'yos-fab';
 
-    const mkBtn = (txt, title, fn) => {
+    const mkB = (icon, tip, fn) => {
       const b = document.createElement('button');
-      b.className = 'yb'; b.textContent = txt; b.title = title;
+      b.className = 'yos-fab-btn';
+      b.textContent = icon;
+      b.setAttribute('data-tip', tip);
       b.addEventListener('click', fn);
       return b;
     };
 
-    const btnTop = mkBtn('↑', 'Back to top (Alt+T)', () => {
-      const s = chatSC(); if (s) s.scrollTo({ top: 0, behavior: 'smooth' });
-    });
-    btnTop.classList.add('yb-hidden');
-    fab.appendChild(btnTop);
+    fab.appendChild(mkB('↑', 'Top (Alt+T)', () => chatSC()?.scrollTo({ top: 0, behavior: 'smooth' })));
+    fab.appendChild(mkB('↓', 'Bottom (Alt+B)', () => { const sc = chatSC(); if (sc) sc.scrollTop = sc.scrollHeight; }));
+    fab.appendChild(mkB('⬆', 'Prev Q (Alt+↑)', () => navQ(-1)));
+    fab.appendChild(mkB('⬇', 'Next Q (Alt+↓)', () => navQ(1)));
+    fab.appendChild(mkB('⬇MD', 'Export MD (Alt+E)', () => exportMD()));
+    fab.appendChild(mkB('🖨', 'Print (Alt+P)', () => window.print()));
 
-    fab.appendChild(mkBtn('↓', 'Scroll to bottom (Alt+B)', () => {
-      const s = chatSC(); if (s) s.scrollTop = s.scrollHeight;
-    }));
-    fab.appendChild(mkBtn('⬆', 'Prev question (Alt+↑)', () => navQ(-1)));
-    fab.appendChild(mkBtn('⬇', 'Next question (Alt+↓)', () => navQ(1)));
-
-    if (CFG.exportMD) {
-      const b = mkBtn('↓MD', 'Export Markdown (Alt+E)', exportMD);
-      b.classList.add('wide'); fab.appendChild(b);
-    }
-    fab.appendChild(mkBtn('🖨', 'Print (Alt+P)', () => window.print()));
     document.body.appendChild(fab);
-
-    setTimeout(() => {
-      const sc = chatSC();
-      if (sc) sc.addEventListener('scroll', throttle(() => {
-        btnTop.classList.toggle('yb-hidden', sc.scrollTop <= 300);
-      }, 300), { passive: true });
-    }, 1000);
     LOG('FAB injected');
   }
 
@@ -521,7 +1055,7 @@
     if (document.getElementById('yos-tip')) return;
     const tip = document.createElement('div');
     tip.id = 'yos-tip';
-    tip.style.cssText = `position:fixed;z-index:99999;display:none;background:${C.bgNav};border:1px solid ${C.accent};color:${C.text};font-size:12px;padding:5px 12px;border-radius:6px;cursor:pointer;user-select:none;box-shadow:0 2px 14px rgba(124,58,237,.4);font-family:system-ui,sans-serif;`;
+    tip.style.cssText = `position:fixed;z-index:99999;display:none;background:#0d0f14;border:1px solid #7c3aed;color:#e8eaf0;font-size:12px;padding:5px 12px;border-radius:6px;cursor:pointer;user-select:none;box-shadow:0 2px 14px rgba(124,58,237,.4);font-family:system-ui,sans-serif;`;
     tip.textContent = '→ Use as prompt';
     document.body.appendChild(tip);
 
@@ -558,13 +1092,17 @@
         case 'ArrowDown': e.preventDefault(); navQ(1);  break;
         case 'e': case 'E': e.preventDefault(); exportMD(); break;
         case 'p': case 'P': e.preventDefault(); window.print(); break;
+        case 'f': case 'F': e.preventDefault();
+          const btn = document.getElementById('yos-proj-btn');
+          if (btn) btn.click();
+          break;
       }
     });
-    LOG('keyboard shortcuts init');
+    LOG('keyboard shortcuts init (Alt+F = project navigator)');
   }
 
   // ─── BOOT ────────────────────────────────────────────────────
-  // Phase 1: CSS immediately
+  // Phase 1: CSS immediately (non-blocking)
   injectCSS();
 
   // Phase 2: All features after load + 2500ms
@@ -574,11 +1112,12 @@
     try { if (CFG.yosLogo) injectLogo(); } catch(e) { ERR('injectLogo', e); }
     try { if (CFG.yosQuickLinks) injectLinks(); } catch(e) { ERR('injectLinks', e); }
     try { if (CFG.projectColors) colorProjects(); } catch(e) { ERR('colorProjects', e); }
+    try { if (CFG.projectNavigator) initProjectNavigator(); } catch(e) { ERR('initProjectNavigator', e); }
     try { if (CFG.fabNav) initFAB(); } catch(e) { ERR('initFAB', e); }
     try { if (CFG.msgToolbar) initMsgToolbar(); } catch(e) { ERR('initMsgToolbar', e); }
     try { if (CFG.selectToPrompt) initSelectToPrompt(); } catch(e) { ERR('initSelectToPrompt', e); }
     try { if (CFG.keyboard) initKeyboard(); } catch(e) { ERR('initKeyboard', e); }
-    LOG('Y-OS Manus client v1.7 loaded ✓');
+    LOG('Y-OS Manus client v1.8 loaded ✓');
   }
 
   // Phase 3: Retry branding at 6s and 15s for SPA route changes
