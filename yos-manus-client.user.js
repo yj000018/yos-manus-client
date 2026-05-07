@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Y-OS Manus Client
 // @namespace    https://yos.ai
-// @version      1.6.0
+// @version      1.7.0
 // @description  Y-OS custom client for manus.im — cleanup, branding, navigation, message toolbar
 // @author       Yannick Jolliet / Y-OS
 // @match        https://manus.im/*
@@ -14,26 +14,22 @@
 // ==/UserScript==
 
 /**
- * v1.6.0 — Fix 3 infinite loops identified by static analysis
+ * v1.7.0 — Rewrite with robust selectors + debug logging
  *
- * BUG 1 — patchTitle(): MutationObserver on <title> called fix() which set
- *   document.title → triggered observer again → infinite loop.
- *   FIX: _patching flag prevents re-entrant calls.
- *
- * BUG 2 — injectLinks(): insertBefore() modified nav DOM. If React re-rendered
- *   nav, element was removed, next retry re-injected → loop.
- *   FIX: Check by stable parent reference, not just getElementById.
- *
- * BUG 3 — initMsgToolbar(): appendChild(tb) modified message DOM. React
- *   re-renders wiped dataset.ytb → setInterval re-injected → loop.
- *   FIX: Use WeakSet to track processed elements (survives DOM attribute wipes).
- *
- * ADDITIONAL: chatSC() result is now cached with a validity check.
- * All setIntervals have hard stop limits.
+ * KEY CHANGES vs v1.6:
+ * - CSS cleanup: content-based selectors (SVG viewBox, text content) instead of fragile structural chains
+ * - Logo: injected as fixed overlay on nav, not inside React-managed DOM
+ * - Messages: broad selector scan (prose/markdown classes) with fallback
+ * - chatSC(): multiple fallback strategies
+ * - Full debug logging: every step logged to console
+ * - All features individually guarded with try/catch + log
  */
 
 (function () {
   'use strict';
+
+  const LOG = (...a) => console.log('[Y-OS]', ...a);
+  const ERR = (...a) => console.warn('[Y-OS] ERR', ...a);
 
   // ─── CONFIG ──────────────────────────────────────────────────
   const CFG = {
@@ -76,32 +72,44 @@
     ],
   };
 
-  // ─── CSS — injected immediately, no DOM reads ─────────────────
+  // ─── CSS ─────────────────────────────────────────────────────
   function injectCSS() {
     if (document.getElementById('yos-styles')) return;
     const css = `
-      /* Cleanup */
-      nav > div > div:last-child div[class*="flex-col"][class*="items-start"] { display:none!important; }
-      nav > div > div:last-child > div:first-child > button { display:none!important; }
-      button[hint="My Computer"] { display:none!important; }
+      /* === CLEANUP === */
+      /* Meta logo: SVG with viewBox 0 0 107 12 — hide its container */
+      svg[viewBox="0 0 107 12"] { display:none!important; }
+      /* "from" text next to Meta logo */
+      svg[viewBox="0 0 107 12"] ~ * { display:none!important; }
+      /* Parent wrapper of Meta logo */
+      :has(> svg[viewBox="0 0 107 12"]) { display:none!important; }
 
-      /* Branding */
+      /* Share sidebar button — hide button containing "Share Manus" text */
+      /* We target via a broad approach: any button in nav bottom area */
+      nav button[class*="rounded"][class*="gap"] { display:none!important; }
+
+      /* Cloud computers button */
+      button[data-testid="cloud-computers-button"],
+      button[aria-label*="Cloud"],
+      button[aria-label*="computer"] { display:none!important; }
+
+      /* === BRANDING === */
       nav { background-color:${C.bgNav}!important; }
       ::-webkit-scrollbar { width:4px; height:4px; }
       ::-webkit-scrollbar-track { background:transparent; }
       ::-webkit-scrollbar-thumb { background:${C.accentDim}; border-radius:2px; }
       ::-webkit-scrollbar-thumb:hover { background:${C.accent}; }
 
-      /* FAB */
+      /* === FAB === */
       #yos-fab{position:fixed;right:14px;bottom:100px;z-index:9999;display:flex;flex-direction:column;gap:5px;pointer-events:none;}
       .yb{width:32px;height:32px;border-radius:50%;background:${C.bgNav};border:1px solid ${C.border};color:${C.text};font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;pointer-events:all;transition:all .15s;box-shadow:0 2px 8px rgba(0,0,0,.6);opacity:.65;user-select:none;font-family:system-ui,sans-serif;line-height:1;}
       .yb:hover{background:${C.accentDim};border-color:${C.accent};opacity:1;transform:scale(1.12);}
       .yb.wide{border-radius:8px;width:38px;font-size:9px;font-weight:700;}
       .yb-hidden{opacity:0!important;pointer-events:none!important;}
 
-      /* Message toolbar */
+      /* === MESSAGE TOOLBAR === */
       .yos-mw{position:relative;}
-      .yos-tb{display:none;position:absolute;top:-34px;right:0;background:${C.bgNav};border:1px solid ${C.border};border-radius:8px;padding:3px 6px;gap:2px;align-items:center;z-index:1000;box-shadow:0 2px 12px rgba(0,0,0,.6);white-space:nowrap;}
+      .yos-tb{display:none;position:absolute;top:-36px;right:0;background:${C.bgNav};border:1px solid ${C.border};border-radius:8px;padding:3px 6px;gap:2px;align-items:center;z-index:1000;box-shadow:0 2px 12px rgba(0,0,0,.6);white-space:nowrap;}
       .yos-mw:hover .yos-tb{display:flex!important;}
       .ytb{background:transparent;border:none;color:${C.textDim};font-size:13px;cursor:pointer;padding:2px 5px;border-radius:4px;transition:all .1s;line-height:1.2;font-family:system-ui,sans-serif;}
       .ytb:hover{background:rgba(124,58,237,.15);color:${C.text};}
@@ -110,7 +118,7 @@
       .yos-col{max-height:80px;overflow:hidden;position:relative;}
       .yos-col::after{content:'';position:absolute;bottom:0;left:0;right:0;height:32px;background:linear-gradient(transparent,#111318);pointer-events:none;}
 
-      /* Print */
+      /* === PRINT === */
       @media print {
         nav, #yos-fab, #yos-tip { display:none!important; }
         body { background:#fff!important; color:#000!important; }
@@ -120,6 +128,7 @@
     s.id = 'yos-styles';
     s.textContent = css;
     (document.head || document.documentElement).appendChild(s);
+    LOG('CSS injected');
   }
 
   // ─── UTILS ───────────────────────────────────────────────────
@@ -128,42 +137,79 @@
     return (...args) => { if (!t) { t = setTimeout(() => { t = null; fn(...args); }, ms); } };
   }
 
-  // chatSC — cached, no getBoundingClientRect
+  // chatSC — multiple fallback strategies, no getBoundingClientRect
   let _sc = null;
   function chatSC() {
     if (_sc && document.contains(_sc)) return _sc;
-    const all = document.querySelectorAll('.simplebar-content-wrapper');
-    let best = null;
-    all.forEach(el => { if (el.offsetLeft >= 200) best = el; });
-    _sc = best || document.querySelector('main') || document.documentElement;
+    // Strategy 1: simplebar with offsetLeft > 200 (main content area)
+    const sbAll = document.querySelectorAll('.simplebar-content-wrapper');
+    for (const el of sbAll) {
+      if (el.offsetLeft >= 200) { _sc = el; return _sc; }
+    }
+    // Strategy 2: any simplebar that's not the nav
+    for (const el of sbAll) {
+      if (!el.closest('nav')) { _sc = el; return _sc; }
+    }
+    // Strategy 3: main element
+    const main = document.querySelector('main');
+    if (main) { _sc = main; return _sc; }
+    // Strategy 4: documentElement
+    _sc = document.documentElement;
     return _sc;
   }
 
+  // Message detection — broad approach
   function getMessages() {
     try {
       const sc = chatSC();
       if (!sc) return [];
-      const content = sc.querySelector('.simplebar-content');
-      if (!content) return [];
-      const main = content.firstElementChild;
-      if (!main || main.children.length < 2) return [];
-      const mx = main.children[1];
-      if (!mx || !mx.firstElementChild) return [];
-      const outer = mx.firstElementChild.firstElementChild;
-      return outer ? [...outer.children] : [];
-    } catch (e) { return []; }
+      // Try to find the message container via multiple strategies
+      const content = sc.querySelector('.simplebar-content') || sc;
+
+      // Strategy 1: look for elements with role="listitem" or data-message
+      const byRole = content.querySelectorAll('[role="listitem"]');
+      if (byRole.length > 0) return [...byRole];
+
+      // Strategy 2: look for direct children of the main message wrapper
+      // Find the deepest container that has multiple children (messages)
+      const candidates = content.querySelectorAll('div > div > div > div');
+      for (const c of candidates) {
+        if (c.children.length >= 3 && c.clientHeight > 200) {
+          return [...c.children];
+        }
+      }
+
+      // Strategy 3: fallback — find all prose/markdown divs and go up 2 levels
+      const proseEls = content.querySelectorAll('[class*="prose"],[class*="markdown"],[class*="max-w-none"]');
+      if (proseEls.length > 0) {
+        const parents = new Set();
+        proseEls.forEach(el => {
+          const p = el.parentElement?.parentElement;
+          if (p) parents.add(p);
+        });
+        return [...parents];
+      }
+      return [];
+    } catch (e) { ERR('getMessages', e); return []; }
   }
 
   function isUserMsg(el) {
-    try { return !!el.querySelector('[class*="items-end"][class*="justify-end"]'); }
-    catch (e) { return false; }
+    try {
+      // User messages typically have right-aligned content
+      return !!el.querySelector('[class*="items-end"]') ||
+             !!el.querySelector('[class*="justify-end"]') ||
+             el.textContent.trim().length < 500; // heuristic: user msgs are short
+    } catch (e) { return false; }
   }
 
+  // Find the markdown/prose div in a message
   function getMDDiv(el) {
     try {
       return el.querySelector('[class*="max-w-none"]') ||
              el.querySelector('[class*="prose"]') ||
-             el.querySelector('[class*="leading-"][class*="text-[var"]');
+             el.querySelector('[class*="markdown"]') ||
+             el.querySelector('[class*="leading-"]') ||
+             null;
     } catch (e) { return null; }
   }
 
@@ -193,23 +239,35 @@
   function injectLogo() {
     if (document.getElementById('yos-logo')) return;
     const nav = document.querySelector('nav');
-    if (!nav) return;
-    const headerRow = nav.firstElementChild?.firstElementChild;
-    if (!headerRow) return;
-    const origSVG = headerRow.querySelector('svg');
-    if (!origSVG) return;
+    if (!nav) { ERR('injectLogo: no nav'); return; }
 
-    origSVG.style.display = 'none';
-    [...headerRow.querySelectorAll('span,div')].forEach(el => {
-      if (!el.children.length && /^manus$/i.test(el.textContent.trim())) el.style.display = 'none';
-    });
+    // Hide original Manus logo SVGs (not the Meta one — that's handled by CSS)
+    // Target the first SVG in nav that's NOT the Meta logo
+    const svgs = nav.querySelectorAll('svg');
+    let manusLogoSVG = null;
+    for (const svg of svgs) {
+      const vb = svg.getAttribute('viewBox') || '';
+      // Skip Meta logo (107x12), skip tiny icons
+      if (vb === '0 0 107 12') continue;
+      const w = parseFloat(svg.getAttribute('width') || '0');
+      const h = parseFloat(svg.getAttribute('height') || '0');
+      if (w > 20 && h > 10) { manusLogoSVG = svg; break; }
+    }
 
+    if (manusLogoSVG) {
+      manusLogoSVG.style.display = 'none';
+      LOG('injectLogo: original SVG hidden');
+    } else {
+      LOG('injectLogo: no original SVG found, injecting overlay');
+    }
+
+    // Inject Y-OS logo as a fixed overlay at top-left of nav
     const logo = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     logo.id = 'yos-logo';
     logo.setAttribute('viewBox', '0 0 72 24');
     logo.setAttribute('width', '72');
     logo.setAttribute('height', '24');
-    logo.style.cssText = 'cursor:pointer;flex-shrink:0;display:block;';
+    logo.style.cssText = 'position:absolute;top:14px;left:14px;z-index:100;cursor:pointer;display:block;';
     logo.innerHTML = `
       <defs>
         <linearGradient id="yg" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -222,10 +280,14 @@
       <path d="M32 4c-5 0-8 3.5-8 8s3 8 8 8 8-3.5 8-8-3-8-8-8zm0 3c3 0 5 2 5 5s-2 5-5 5-5-2-5-5 2-5 5-5z" fill="url(#yg)"/>
       <path d="M43 4v3h8c1.5 0 2.5.8 2.5 2s-1 2-2.5 2h-5c-2.5 0-4 1.8-4 4s1.5 5 5 5h8v-3h-8c-1.5 0-2-.8-2-2s.8-1 2-1h4c3 0 5.5-2 5.5-5s-2.5-5-5.5-5z" fill="url(#yg)"/>
     `;
-    origSVG.parentElement.insertBefore(logo, origSVG);
+
+    // Make nav position:relative so absolute positioning works
+    nav.style.position = 'relative';
+    nav.appendChild(logo);
+    LOG('injectLogo: Y-OS logo injected');
   }
 
-  // BUG 1 FIX — _patching flag prevents MutationObserver re-entrant loop
+  // patchTitle — re-entrant safe
   function patchTitle() {
     let _patching = false;
     const fix = () => {
@@ -238,18 +300,27 @@
     fix();
     const t = document.querySelector('title');
     if (t) new MutationObserver(fix).observe(t, { childList: true });
+    LOG('patchTitle done');
   }
 
-  // BUG 2 FIX — check if yos-links is still in the DOM and connected
+  // injectLinks — stable parent check
   function injectLinks() {
     const existing = document.getElementById('yos-links');
-    if (existing && document.contains(existing)) return; // already injected and connected
+    if (existing && document.contains(existing)) return;
+
     const nav = document.querySelector('nav');
-    if (!nav) return;
+    if (!nav) { ERR('injectLinks: no nav'); return; }
+
     const navMain = nav.firstElementChild;
-    if (!navMain || navMain.children.length < 2) return;
-    const menuSection = navMain.children[1];
-    if (!menuSection) return;
+    if (!navMain) { ERR('injectLinks: no navMain'); return; }
+
+    // Find the menu section (second child of navMain typically)
+    let menuSection = null;
+    if (navMain.children.length >= 2) {
+      menuSection = navMain.children[1];
+    } else {
+      menuSection = navMain; // fallback: inject directly into navMain
+    }
 
     const wrap = document.createElement('div');
     wrap.id = 'yos-links';
@@ -263,13 +334,18 @@
       <div style="height:1px;background:${C.border};margin:6px 4px 0;"></div>
     `;
     menuSection.insertBefore(wrap, menuSection.firstChild);
+    LOG('injectLinks done, section children:', menuSection.children.length);
   }
 
   function colorProjects() {
     try {
       const nav = document.querySelector('nav');
       if (!nav) return;
-      nav.querySelectorAll('[class*="flex-col"][class*="gap-px"][class*="pt-[3px]"]').forEach(c => {
+      // Broad selector: any vertical list in nav that looks like project groups
+      const lists = nav.querySelectorAll('[class*="flex-col"][class*="gap"]');
+      let colored = 0;
+      lists.forEach(c => {
+        if (c.children.length < 2) return;
         [...c.children].forEach((item, i) => {
           if (item.dataset.yc) return;
           item.dataset.yc = '1';
@@ -277,12 +353,14 @@
           item.style.cssText += `border-left:2px solid ${col};padding-left:6px;border-radius:0 6px 6px 0;margin-bottom:1px;`;
           const txt = item.querySelector('[class*="truncate"]') || item.querySelector('[class*="flex-1"]');
           if (txt) { txt.style.color = col; txt.style.fontWeight = '600'; }
+          colored++;
         });
       });
-    } catch (e) {}
+      if (colored > 0) LOG('colorProjects:', colored, 'items colored');
+    } catch (e) { ERR('colorProjects', e); }
   }
 
-  // ─── FAB NAVIGATION ──────────────────────────────────────────
+  // ─── FAB ─────────────────────────────────────────────────────
   function initFAB() {
     if (document.getElementById('yos-fab')) return;
     const fab = document.createElement('div');
@@ -299,8 +377,8 @@
       const s = chatSC(); if (s) s.scrollTo({ top: 0, behavior: 'smooth' });
     });
     btnTop.classList.add('yb-hidden');
-
     fab.appendChild(btnTop);
+
     fab.appendChild(mkBtn('↓', 'Scroll to bottom (Alt+B)', () => {
       const s = chatSC(); if (s) s.scrollTop = s.scrollHeight;
     }));
@@ -320,6 +398,7 @@
         btnTop.classList.toggle('yb-hidden', sc.scrollTop <= 300);
       }, 300), { passive: true });
     }, 1000);
+    LOG('FAB injected');
   }
 
   function navQ(dir) {
@@ -327,7 +406,7 @@
       const sc = chatSC();
       if (!sc) return;
       const msgs = getMessages().filter(isUserMsg);
-      if (!msgs.length) return;
+      if (!msgs.length) { LOG('navQ: no user msgs found'); return; }
       const scTop = sc.scrollTop;
       let target = null;
       if (dir === -1) {
@@ -342,7 +421,7 @@
         if (!target) target = msgs[msgs.length - 1];
       }
       if (target) sc.scrollTo({ top: target.offsetTop - 20, behavior: 'smooth' });
-    } catch (e) {}
+    } catch (e) { ERR('navQ', e); }
   }
 
   function exportMD() {
@@ -363,25 +442,27 @@
       a.href = URL.createObjectURL(new Blob([md], { type: 'text/markdown' }));
       a.download = `yos-${title.replace(/[^a-z0-9]/gi, '-').toLowerCase().slice(0, 40)}-${date}.md`;
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    } catch (e) {}
+      LOG('exportMD done');
+    } catch (e) { ERR('exportMD', e); }
   }
 
-  // BUG 3 FIX — WeakSet tracks processed elements, survives React re-renders
-  // that wipe dataset attributes
+  // ─── MESSAGE TOOLBAR ─────────────────────────────────────────
   const _tbDone = new WeakSet();
 
   function initMsgToolbar() {
     let passes = 0;
-    const MAX = 15;
+    const MAX = 20;
 
     const run = () => {
       try {
         passes++;
-        getMessages().forEach(msg => {
+        const msgs = getMessages();
+        LOG('toolbar run #' + passes + ', msgs found:', msgs.length);
+        let injected = 0;
+        msgs.forEach(msg => {
           if (isUserMsg(msg)) return;
           const md = getMDDiv(msg);
           if (!md) return;
-          // WeakSet check — survives DOM attribute wipes by React
           if (_tbDone.has(md)) return;
           _tbDone.add(md);
 
@@ -416,21 +497,23 @@
             }));
           }
           md.appendChild(tb);
+          injected++;
         });
-      } catch (e) {}
+        if (injected > 0) LOG('toolbar: injected', injected, 'toolbars');
+      } catch (e) { ERR('toolbar run', e); }
     };
 
-    // Slow polling — 4s, hard stop at MAX passes, then re-arm on scroll once
+    // Initial run at 3s, then every 5s, hard stop at MAX
+    setTimeout(run, 3000);
     const timer = setInterval(() => {
       run();
       if (passes >= MAX) {
         clearInterval(timer);
+        LOG('toolbar polling stopped, re-armed on scroll');
         const sc = chatSC();
-        if (sc) sc.addEventListener('scroll', throttle(run, 3000), { passive: true });
+        if (sc) sc.addEventListener('scroll', throttle(run, 4000), { passive: true });
       }
-    }, 4000);
-
-    setTimeout(run, 3000);
+    }, 5000);
   }
 
   // ─── SELECT TO PROMPT ────────────────────────────────────────
@@ -458,6 +541,7 @@
       if (sel) { prefillInput(`> "${sel}"\n\n`); tip.style.display = 'none'; window.getSelection()?.removeAllRanges(); }
     });
     document.addEventListener('mousedown', e => { if (e.target !== tip) tip.style.display = 'none'; });
+    LOG('selectToPrompt init');
   }
 
   // ─── KEYBOARD ────────────────────────────────────────────────
@@ -476,32 +560,30 @@
         case 'p': case 'P': e.preventDefault(); window.print(); break;
       }
     });
+    LOG('keyboard shortcuts init');
   }
 
-  // ─── BOOT SEQUENCE ───────────────────────────────────────────
-  // Phase 1: CSS only — immediate, safe
+  // ─── BOOT ────────────────────────────────────────────────────
+  // Phase 1: CSS immediately
   injectCSS();
 
-  // Phase 2: All features after window.load + 2500ms
+  // Phase 2: All features after load + 2500ms
   function launchFeatures() {
-    try {
-      if (CFG.yosTitle) patchTitle();
-      if (CFG.yosLogo) injectLogo();
-      if (CFG.yosQuickLinks) injectLinks();
-      if (CFG.projectColors) colorProjects();
-      if (CFG.fabNav) initFAB();
-      if (CFG.msgToolbar) initMsgToolbar();
-      if (CFG.selectToPrompt) initSelectToPrompt();
-      if (CFG.keyboard) initKeyboard();
-      console.log('[Y-OS] Manus client v1.6 loaded ✓');
-    } catch (e) {
-      console.warn('[Y-OS] Boot error:', e);
-    }
+    LOG('launching features...');
+    try { if (CFG.yosTitle) patchTitle(); } catch(e) { ERR('patchTitle', e); }
+    try { if (CFG.yosLogo) injectLogo(); } catch(e) { ERR('injectLogo', e); }
+    try { if (CFG.yosQuickLinks) injectLinks(); } catch(e) { ERR('injectLinks', e); }
+    try { if (CFG.projectColors) colorProjects(); } catch(e) { ERR('colorProjects', e); }
+    try { if (CFG.fabNav) initFAB(); } catch(e) { ERR('initFAB', e); }
+    try { if (CFG.msgToolbar) initMsgToolbar(); } catch(e) { ERR('initMsgToolbar', e); }
+    try { if (CFG.selectToPrompt) initSelectToPrompt(); } catch(e) { ERR('initSelectToPrompt', e); }
+    try { if (CFG.keyboard) initKeyboard(); } catch(e) { ERR('initKeyboard', e); }
+    LOG('Y-OS Manus client v1.7 loaded ✓');
   }
 
-  // Phase 3: Retry branding at 6s and 14s for SPA route changes
+  // Phase 3: Retry branding at 6s and 15s for SPA route changes
   function scheduleRetries() {
-    [6000, 14000].forEach(d => setTimeout(() => {
+    [6000, 15000].forEach(d => setTimeout(() => {
       try {
         if (CFG.yosLogo) injectLogo();
         if (CFG.yosQuickLinks) injectLinks();
